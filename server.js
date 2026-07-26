@@ -89,7 +89,7 @@ const server = http.createServer(async (req,res) => {
     if(req.method==='GET'&&url.pathname==='/healthz')return send(res,200,{ok:true,mode:MODE,databaseConfigured:Boolean(pool),requestId});
     if(req.method==='GET'&&url.pathname==='/api/v1/public/config')return send(res,200,{mode:MODE,realMoneyEnabled:false,message:'Payments and real-money play are disabled until licensed production services are configured.',requestId});
     if(url.pathname.startsWith('/api/v1/auth/')||url.pathname.startsWith('/api/v1/wallet/'))return await handleAuth(req,res,url,requestId,ip);
-    if(req.method==='GET'&&(url.pathname==='/'||url.pathname==='/winza.html'))return fs.readFile(path.join(root,'winza.html'),(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));
+    if(req.method==='GET'&&(url.pathname==='/'||url.pathname==='/winza.html'))return fs.readFile(path.join(root,'winza.html'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));
     return fail(res,404,'Not found',requestId);
   } catch(e) { console.error(`[${requestId}]`,e); return fail(res,500,'Unexpected server error.',requestId); }
 });
