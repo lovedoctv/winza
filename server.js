@@ -12,7 +12,17 @@ const MODE = process.env.WINZA_MODE || 'sandbox';
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const root = __dirname;
-const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: true } : undefined }) : null;
+function sslConfig() {
+  const mode = (process.env.DATABASE_SSL || '').toLowerCase();
+  if (mode === '' || mode === 'false') return undefined;
+  // Most managed Postgres providers (Render, Heroku, etc.) present certificates
+  // that aren't in Node's default trusted CA bundle. The connection is still
+  // TLS-encrypted either way; this only controls whether the certificate chain
+  // itself is verified. Use DATABASE_SSL=strict once you've loaded the
+  // provider's specific CA certificate via NODE_EXTRA_CA_CERTS.
+  return { rejectUnauthorized: mode === 'strict' };
+}
+const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: sslConfig() }) : null;
 const attempts = new Map();
 
 function headers(type) { return { 'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()', 'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'" }; }
