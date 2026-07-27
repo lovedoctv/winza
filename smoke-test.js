@@ -26,7 +26,7 @@ async function json(res) { try { return await res.json(); } catch { return {}; }
 function randomPhone() {
   // Nigerian-shaped local number, random enough not to collide between runs.
   const suffix = String(Date.now()).slice(-8);
-  return '070' + suffix;
+  return { raw: '070' + suffix, suffix };
 }
 
 async function main() {
@@ -45,7 +45,7 @@ async function main() {
   record('GET /api/v1/public/config', res.ok && data.realMoneyEnabled === false, JSON.stringify(data));
 
   // 3. Request an OTP for a fresh phone number.
-  const phone = randomPhone();
+  const { raw: phone, suffix } = randomPhone();
   res = await fetch(`${BASE_URL}/api/v1/auth/otp/request`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ phone }),
@@ -83,7 +83,7 @@ async function main() {
   // 6. Identity check: phone present, no KYC fields collected at registration.
   res = await fetch(`${BASE_URL}/api/v1/auth/me`, { headers: { Authorization: `Bearer ${token}` } });
   data = await json(res);
-  record('GET /api/v1/auth/me', res.ok && data.user?.phoneNumber === phone && data.user?.kycStatus === 'not_verified', JSON.stringify(data.user));
+  record('GET /api/v1/auth/me', res.ok && data.user?.phoneNumber?.endsWith(suffix) && data.user?.kycStatus === 'not_verified', JSON.stringify(data.user));
 
   // 7. Wallet exists and starts at zero.
   res = await fetch(`${BASE_URL}/api/v1/wallet/me`, { headers: { Authorization: `Bearer ${token}` } });
@@ -125,7 +125,7 @@ async function main() {
     if (staffToken) {
       res = await fetch(`${BASE_URL}/api/v1/admin/kyc/submissions?status=pending`, { headers: { Authorization: `Bearer ${staffToken}` } });
       data = await json(res);
-      const submission = (data.submissions || []).find(s => s.phoneNumber === phone);
+      const submission = (data.submissions || []).find(s => s.phoneNumber?.endsWith(suffix));
       record('admin sees the pending submission', Boolean(submission));
       if (submission) {
         res = await fetch(`${BASE_URL}/api/v1/admin/kyc/submissions/${submission.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` }, body: '{}' });

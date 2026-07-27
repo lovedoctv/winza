@@ -390,7 +390,7 @@
     </div>
   </div>
 
-  <div class="utility-bar"><button class="utility-btn" onclick="openAuth()" id="accountBtn">Account</button><button class="utility-btn" onclick="openDailyReward()">Daily rewards</button><button class="utility-btn" onclick="switchTab('hub')">Rewards hub</button><button class="utility-btn" onclick="openNotifications()">Alerts <span class="notify-dot" id="notificationCount">0</span></button></div>
+  <div class="utility-bar"><button class="utility-btn" onclick="handleAccountClick()" id="accountBtn">Account</button><button class="utility-btn" onclick="openDailyReward()">Daily rewards</button><button class="utility-btn" onclick="switchTab('hub')">Rewards hub</button><button class="utility-btn" onclick="openNotifications()">Alerts <span class="notify-dot" id="notificationCount">0</span></button></div>
   <div class="jackpot-banner">
     <div class="jackpot-label">Today's Community Jackpot</div>
     <div class="jackpot-amount" id="jackpotAmt">₦5,000,000</div>
@@ -510,6 +510,11 @@
   </div>
 
   <div class="tab-panel" id="tab-profile">
+    <div class="settings-card">
+      <h3>Account</h3>
+      <div class="settings-card-sub" id="profileAccountInfo">Sign in to see your account details.</div>
+      <button class="btn-deposit" id="profileSignInBtn" style="margin-top:4px;" onclick="openAuth()">Sign in</button>
+    </div>
     <div class="profile-header">
       <div class="profile-avatar" id="profileAvatar">W</div>
       <div class="profile-name" id="profileName">Player One</div>
@@ -560,6 +565,12 @@
   </div>
 
   <div class="tab-panel" id="tab-settings">
+    <div class="settings-card" id="settingsAccountCard">
+      <h3>Account</h3>
+      <div class="settings-card-sub" id="settingsAccountInfo">Not signed in.</div>
+      <button class="btn-deposit" id="settingsSignInBtn" onclick="openAuth()">Sign in</button>
+      <button class="btn-danger" id="settingsLogoutBtn" style="display:none;" onclick="logoutAccount()">Log out</button>
+    </div>
     <div class="settings-card"><h3>Theme</h3><div class="theme-options"><button onclick="setTheme('classic')">Classic WINZA</button><button onclick="setTheme('gold')">Gold</button><button onclick="setTheme('neon')">Neon</button><button onclick="setTheme('ocean')">Ocean</button></div></div>
     <div class="settings-card">
       <h3>🔊 Sound &amp; Feedback</h3>
@@ -1609,8 +1620,36 @@
   window.redeemPromo=()=>{const input=document.getElementById('promoInput'),code=input.value.trim().toUpperCase(),rewards={WELCOME100:1000,WINZA2026:2026,VIP500:500};if(!rewards[code])return showToast('Invalid promo code');if(state.enhance.promoCodes.includes(code))return showToast('Code already redeemed');state.enhance.promoCodes.push(code);state.balance+=rewards[code];addTx('deposit',rewards[code],'Promo '+code);notify('Promo reward credited');input.value='';save();render();renderEnhancements();showToast('Promo applied: ₦'+rewards[code].toLocaleString());};
   window.inviteFriend=()=>{state.enhance.friends++;notify('Friend invitation sent');save();showToast('Invite link copied (demo)');};window.setTheme=(theme)=>{state.enhance.theme=theme;document.body.classList.remove('theme-gold','theme-neon','theme-ocean');if(theme!=='classic')document.body.classList.add('theme-'+theme);save();showToast(theme+' theme applied');};
   // Account UI uses the server API. Local game data remains sandbox-only until wallet migration.
-  let authPhone='';
-  window.openAuth=()=>{if(sessionStorage.getItem('wz_access_token')){logoutAccount();return;}document.getElementById('authTitle').textContent='Sign in to WINZA';document.getElementById('authPhoneForm').hidden=false;document.getElementById('authOtpForm').hidden=true;document.getElementById('authPhone').value='';document.getElementById('authModal').classList.add('show');};window.closeAuth=()=>document.getElementById('authModal').classList.remove('show');
+  window.handleAccountClick = function() {
+    if (sessionStorage.getItem('wz_access_token')) { switchTab('profile'); }
+    else { openAuth(); }
+  };
+
+  let currentAccountUser = null;
+  function renderAccountUI() {
+    const token = sessionStorage.getItem('wz_access_token');
+    const profileInfo = document.getElementById('profileAccountInfo');
+    const profileSignIn = document.getElementById('profileSignInBtn');
+    const settingsInfo = document.getElementById('settingsAccountInfo');
+    const settingsSignIn = document.getElementById('settingsSignInBtn');
+    const settingsLogout = document.getElementById('settingsLogoutBtn');
+    if (!profileInfo) return;
+    if (!token || !currentAccountUser) {
+      profileInfo.textContent = 'Sign in to see your account details.';
+      profileSignIn.style.display = 'inline-block';
+      settingsInfo.textContent = 'Not signed in.';
+      settingsSignIn.style.display = 'inline-block';
+      settingsLogout.style.display = 'none';
+      return;
+    }
+    const text = currentAccountUser.phoneNumber || currentAccountUser.email || currentAccountUser.displayName;
+    profileInfo.textContent = 'Signed in as ' + text + ' · KYC: ' + (currentAccountUser.kycStatus || 'not_verified');
+    profileSignIn.style.display = 'none';
+    settingsInfo.textContent = 'Signed in as ' + text + '.';
+    settingsSignIn.style.display = 'none';
+    settingsLogout.style.display = 'inline-block';
+  }
+  window.openAuth=()=>{document.getElementById('authTitle').textContent='Sign in to WINZA';document.getElementById('authPhoneForm').hidden=false;document.getElementById('authOtpForm').hidden=true;document.getElementById('authPhone').value='';document.getElementById('authModal').classList.add('show');};window.closeAuth=()=>document.getElementById('authModal').classList.remove('show');
   async function authRequest(endpoint,payload){const response=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Request failed');return data;}
 
   // --- Real account balance (server wallet). Kept fully separate from state.balance,
@@ -1688,31 +1727,37 @@
     document.getElementById('accountBtn').textContent = 'Account';
     serverWallet = null;
     kycStatus = null;
+    currentAccountUser = null;
     renderAccountWallet();
     renderKycCard();
+    renderAccountUI();
     showToast('Signed out.');
     if (token) { try { await fetch('/api/v1/auth/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + token } }); } catch (e) {} }
   }
 
   async function restoreSession() {
     const token = sessionStorage.getItem('wz_access_token');
-    if (!token) { renderAccountWallet(); renderKycCard(); return; }
+    if (!token) { renderAccountWallet(); renderKycCard(); renderAccountUI(); return; }
     try {
       const response = await fetch('/api/v1/auth/me', { headers: { Authorization: 'Bearer ' + token } });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error('Session expired');
       document.getElementById('accountBtn').textContent = data.user.displayName;
+      currentAccountUser = data.user;
+      renderAccountUI();
       await refreshServerWallet();
       await refreshKycStatus();
     } catch (error) {
       sessionStorage.removeItem('wz_access_token');
       document.getElementById('accountBtn').textContent = 'Account';
+      currentAccountUser = null;
       renderAccountWallet();
       renderKycCard();
+      renderAccountUI();
     }
   }
   document.getElementById('authPhoneForm').addEventListener('submit',async event=>{event.preventDefault();const phone=document.getElementById('authPhone').value.trim(),button=document.getElementById('authPhoneSubmit');button.disabled=true;try{const data=await authRequest('/api/v1/auth/otp/request',{phone});authPhone=phone;document.getElementById('authPhoneDisplay').textContent=phone;document.getElementById('authPhoneForm').hidden=true;document.getElementById('authOtpForm').hidden=false;document.getElementById('authTitle').textContent='Enter your code';document.getElementById('authOtpCode').value='';const note=document.getElementById('authDevCodeNote');if(data.devCode){note.hidden=false;note.textContent='Testing mode — no SMS provider configured yet. Code: '+data.devCode;}else{note.hidden=true;}showToast('Code sent.');}catch(error){showToast(error.message);}finally{button.disabled=false;}});
-  document.getElementById('authOtpForm').addEventListener('submit',async event=>{event.preventDefault();const code=document.getElementById('authOtpCode').value.trim(),button=document.getElementById('authOtpSubmit');button.disabled=true;try{const data=await authRequest('/api/v1/auth/otp/verify',{phone:authPhone,code});sessionStorage.setItem('wz_access_token',data.accessToken);document.getElementById('accountBtn').textContent=data.user.displayName;closeAuth();showToast(data.isNewAccount?'Account created — welcome!':'Signed in successfully.');await refreshServerWallet();await refreshKycStatus();}catch(error){showToast(error.message);}finally{button.disabled=false;}});
+  document.getElementById('authOtpForm').addEventListener('submit',async event=>{event.preventDefault();const code=document.getElementById('authOtpCode').value.trim(),button=document.getElementById('authOtpSubmit');button.disabled=true;try{const data=await authRequest('/api/v1/auth/otp/verify',{phone:authPhone,code});sessionStorage.setItem('wz_access_token',data.accessToken);document.getElementById('accountBtn').textContent=data.user.displayName;currentAccountUser=data.user;renderAccountUI();closeAuth();showToast(data.isNewAccount?'Account created — welcome!':'Signed in successfully.');await refreshServerWallet();await refreshKycStatus();}catch(error){showToast(error.message);}finally{button.disabled=false;}});
   document.getElementById('kycForm').addEventListener('submit',async event=>{event.preventDefault();const button=document.getElementById('kycSubmit');button.disabled=true;try{const token=sessionStorage.getItem('wz_access_token');const response=await fetch('/api/v1/kyc/submit',{method:'POST',headers:{'content-type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({fullName:document.getElementById('kycFullName').value,dateOfBirth:document.getElementById('kycDob').value,idType:document.getElementById('kycIdType').value,idNumber:document.getElementById('kycIdNumber').value})});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Unable to submit.');showToast('Submitted for review.');closeKyc();await refreshKycStatus();}catch(error){showToast(error.message);}finally{button.disabled=false;}});
   setInterval(()=>{liveFeed.unshift({name:FEED_NAMES[Math.floor(Math.random()*FEED_NAMES.length)],text:['won ₦25,000','hit a jackpot','earned VIP Gold','opened a Lucky Box'][Math.floor(Math.random()*4)]});liveFeed=liveFeed.slice(0,8);renderEnhancements();},5500);
   function load() {

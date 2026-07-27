@@ -31,6 +31,12 @@ function send(res, status, payload, type='application/json; charset=utf-8') { re
 function fail(res, status, message, requestId) { return send(res, status, { error: message, requestId }); }
 function audit(userId, type, ip, metadata={}) { if (!pool) return; const ipHash=crypto.createHash('sha256').update(String(ip||'')).digest('hex'); pool.query('INSERT INTO audit_events (id,user_id,type,ip_hash,metadata) VALUES ($1,$2,$3,$4,$5)',[crypto.randomUUID(),userId||null,type,ipHash,metadata]).catch(()=>{}); }
 function throttled(ip) { const now=Date.now(), record=attempts.get(ip)||{count:0,start:now}; if(now-record.start>15*60_000){record.count=0;record.start=now;} record.count++;attempts.set(ip,record);return record.count>20; }
+// Behind a reverse proxy (Render, or any other PaaS), req.socket.remoteAddress
+// is the proxy's own internal address — identical for every request — which
+// would make rate limiting and the audit log's IP tracking meaningless. Trust
+// the first hop of X-Forwarded-For instead, falling back to the socket address
+// when there's no proxy in front (e.g. running locally).
+function clientIp(req) { const forwarded=req.headers['x-forwarded-for']; if (forwarded) return String(forwarded).split(',')[0].trim(); return req.socket.remoteAddress; }
 async function body(req) { return new Promise((resolve,reject)=>{let raw='';req.on('data',c=>{raw+=c;if(raw.length>16_384)req.destroy();});req.on('end',()=>{try{resolve(raw?JSON.parse(raw):{});}catch{reject(new Error('Invalid JSON body'));}});req.on('error',reject);}); }
 function ready(res, requestId) { if (!pool || !JWT_SECRET || JWT_SECRET.length < 32) { fail(res,503,'Authentication service is not configured.',requestId); return false; } return true; }
 async function sessionFrom(req) { const token=(req.headers.authorization||'').replace(/^Bearer\s+/i,''); const payload=auth.verify(token,JWT_SECRET); const { rows }=await pool.query('SELECT s.id,u.id AS user_id,u.email,u.phone_number,u.display_name,u.role,u.is_active,u.kyc_status FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND s.expires_at>now() AND s.revoked_at IS NULL',[payload.sid]); if(!rows[0]||!rows[0].is_active)throw new Error('Unauthorized'); return rows[0]; }
