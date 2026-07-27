@@ -81,12 +81,18 @@
   input[type=range] { width: 100%; accent-color: var(--ijebu-gold); height: 4px; }
   .preset-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
   .chip {
-    padding: 4px 10px; border-radius: 6px; border: 1px solid var(--plum-line);
-    background: var(--ink-night); color: var(--chalk-dim); font-size: 11px;
-    font-family: 'Space Mono', monospace; cursor: pointer; transition: all 0.15s;
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 32px; min-width: 48px; padding: 6px 12px; border-radius: 6px;
+    border: 1px solid var(--plum-line); background: var(--ink-night); color: var(--chalk-dim);
+    font-size: 11px; font-family: 'Space Mono', monospace; font-weight: 500;
+    cursor: pointer; transition: all 0.15s; user-select: none; -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+    appearance: none; -webkit-appearance: none; margin: 0; line-height: 1;
   }
   .chip:hover { border-color: var(--ijebu-gold); color: var(--ijebu-gold); }
+  .chip:active { transform: scale(0.96); }
   .chip.active { background: var(--ijebu-gold); color: var(--ink-night); border-color: var(--ijebu-gold); font-weight: 700; }
+  .chip:disabled, .chip.out-of-range { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
   .payout-readout { display: flex; justify-content: space-between; align-items: baseline; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--plum-line); }
   .payout-readout .readout-block { text-align: left; }
   .payout-readout .readout-label { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--chalk-dim); display: block; margin-bottom: 2px; }
@@ -414,22 +420,22 @@
         <div class="risk-label"><span>Stake</span><strong id="stakeLabel">₦1,000</strong></div>
         <input type="range" id="stakeSlider" min="100" max="25000" step="100" value="100">
         <div class="preset-chips" id="stakeChips">
-          <span class="chip" data-val="100">₦100</span>
-          <span class="chip" data-val="1000">₦1K</span>
-          <span class="chip" data-val="5000">₦5K</span>
-          <span class="chip" data-val="10000">₦10K</span>
-          <span class="chip" data-val="25000">₦25K</span>
+          <button type="button" class="chip" data-val="100">₦100</button>
+          <button type="button" class="chip" data-val="1000">₦1K</button>
+          <button type="button" class="chip" data-val="5000">₦5K</button>
+          <button type="button" class="chip" data-val="10000">₦10K</button>
+          <button type="button" class="chip" data-val="25000">₦25K</button>
         </div>
       </div>
       <div class="risk-row">
         <div class="risk-label"><span>Payout multiplier</span><strong id="multLabel">10.0×</strong></div>
         <input type="range" id="multSlider" min="1.1" max="10" step="0.1" value="10">
         <div class="preset-chips" id="multChips">
-          <span class="chip" data-val="1.5">1.5×</span>
-          <span class="chip" data-val="2">2×</span>
-          <span class="chip" data-val="3">3×</span>
-          <span class="chip" data-val="5">5×</span>
-          <span class="chip" data-val="10">10×</span>
+          <button type="button" class="chip" data-val="1.5">1.5×</button>
+          <button type="button" class="chip" data-val="2">2×</button>
+          <button type="button" class="chip" data-val="3">3×</button>
+          <button type="button" class="chip" data-val="5">5×</button>
+          <button type="button" class="chip" data-val="10">10×</button>
         </div>
       </div>
       <div class="payout-readout">
@@ -1036,23 +1042,39 @@
   });
 
   function updateChips(container, val) {
+    const n = Number(val);
     container.querySelectorAll('.chip').forEach(c => {
-      c.classList.toggle('active', Number(c.dataset.val) === Number(val));
+      const chipVal = Number(c.dataset.val);
+      c.classList.toggle('active', chipVal === n);
+      if (container === el.stakeChips) {
+        const out = chipVal < state.config.minStake || chipVal > state.config.maxStake;
+        c.classList.toggle('out-of-range', out);
+        c.disabled = out || isSpinning;
+      } else {
+        c.disabled = isSpinning;
+      }
     });
   }
   el.stakeChips.querySelectorAll('.chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      if (isSpinning) return;
-      el.stakeSlider.value = chip.dataset.val;
-      updateChips(el.stakeChips, chip.dataset.val);
+    chip.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isSpinning || chip.disabled) return;
+      const val = Number(chip.dataset.val);
+      if (val < state.config.minStake || val > state.config.maxStake) return;
+      el.stakeSlider.value = String(val);
+      state.lastStake = val;
       updateRiskPanel();
     });
   });
   el.multChips.querySelectorAll('.chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      if (isSpinning) return;
-      el.multSlider.value = chip.dataset.val;
-      updateChips(el.multChips, chip.dataset.val);
+    chip.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isSpinning || chip.disabled) return;
+      const val = Number(chip.dataset.val);
+      el.multSlider.value = String(val);
+      state.lastMultiplier = val;
       updateRiskPanel();
     });
   });
@@ -1197,6 +1219,8 @@
     el.stakeSlider.disabled = true;
     el.multSlider.disabled = true;
     document.querySelectorAll('.mode-btn').forEach(b => b.disabled = true);
+    el.stakeChips.querySelectorAll('.chip').forEach(c => { c.disabled = true; });
+    el.multChips.querySelectorAll('.chip').forEach(c => { c.disabled = true; });
     state.balance -= stake;
     state.totalWagered += stake;
     state.loyaltyPoints += Math.floor(stake / 100);
@@ -1422,6 +1446,7 @@
     if (Number(el.stakeSlider.value) < state.config.minStake) el.stakeSlider.value = state.config.minStake;
     if (Number(el.stakeSlider.value) > state.config.maxStake) el.stakeSlider.value = state.config.maxStake;
     state.lastStake = Number(el.stakeSlider.value);
+    updateChips(el.stakeChips, state.lastStake);
   }
 
   // --- Admin back-office preview (demo only) ---
