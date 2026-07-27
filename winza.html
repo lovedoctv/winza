@@ -307,7 +307,7 @@
   .stat-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; }.stat-mini { padding:11px; background:var(--ink-night); border-radius:9px; text-align:center; }.stat-mini b { display:block; color:var(--ijebu-gold); font-family:'Space Mono',monospace; font-size:15px; }
   .enhance-modal { position:fixed; inset:0; display:none; z-index:250; align-items:center; justify-content:center; padding:18px; background:rgba(10,6,22,.76); backdrop-filter:blur(5px); }.enhance-modal.show { display:flex; }.enhance-modal .modal { max-width:430px; width:100%; max-height:88vh; overflow:auto; }.confetti-pop { animation:rewardPop .55s cubic-bezier(.2,1.4,.4,1); }@keyframes rewardPop { 0%{transform:scale(.85);opacity:0} 100%{transform:scale(1);opacity:1} }
   .theme-options { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; }.theme-options button { border:1px solid var(--plum-line); background:var(--ink-night); color:var(--chalk); border-radius:8px; padding:10px; cursor:pointer; font-size:11px; }
-  .auth-form { display:grid; gap:10px; }.auth-form input { width:100%; border:1px solid var(--plum-line); border-radius:8px; padding:10px; background:var(--ink-night); color:var(--chalk); font:inherit; }.auth-form label { font-size:11px; color:var(--chalk-dim); }.auth-links { display:flex; justify-content:space-between; gap:8px; margin-top:10px; }.auth-links button { background:none; border:0; color:var(--ijebu-gold); font-size:11px; cursor:pointer; padding:0; }
+  .auth-form { display:grid; gap:10px; }.auth-form input,.auth-form select { width:100%; border:1px solid var(--plum-line); border-radius:8px; padding:10px; background:var(--ink-night); color:var(--chalk); font:inherit; }.auth-form label { font-size:11px; color:var(--chalk-dim); }.auth-links { display:flex; justify-content:space-between; gap:8px; margin-top:10px; }.auth-links button { background:none; border:0; color:var(--ijebu-gold); font-size:11px; cursor:pointer; padding:0; }
   body.theme-neon { --ink-night:#090319; --deep-plum:#1d0b40; --plum-line:#783ee8; --ijebu-gold:#46ffcf; --market-coral:#ff4fd8; --palm-green:#57d9ff; }body.theme-ocean { --ink-night:#071d31; --deep-plum:#0c3152; --plum-line:#17618d; --ijebu-gold:#ffd166; --market-coral:#ff7b54; --palm-green:#52d6b6; }body.theme-gold { --ink-night:#211504; --deep-plum:#392606; --plum-line:#806119; --ijebu-gold:#ffd35a; --market-coral:#dc9432; --palm-green:#a8d672; }
 </style>
 </head>
@@ -317,7 +317,8 @@
 <div class="toast" id="toast"></div>
 <div class="enhance-modal" id="dailyRewardModal"><div class="modal confetti-pop"><h3>Daily Login Reward</h3><div class="reward-calendar" id="rewardCalendar"></div><p class="subtle" id="rewardTimer"></p><button class="claim-btn" id="claimDailyBtn">Claim today’s reward</button><button class="btn-cancel" onclick="closeDailyReward()">Not now</button></div></div>
 <div class="enhance-modal" id="notificationModal"><div class="modal"><h3>Notification Center</h3><div id="notificationList"></div><button class="btn-cancel" onclick="closeNotifications()">Close</button></div></div>
-<div class="enhance-modal" id="authModal"><div class="modal"><h3 id="authTitle">Sign in to WINZA</h3><form class="auth-form" id="authForm"><label id="authNameLabel">Display name<input id="authName" autocomplete="name" maxlength="40"></label><label>Email<input id="authEmail" type="email" autocomplete="email" required></label><label>Password<input id="authPassword" type="password" autocomplete="current-password" minlength="12" required></label><label id="authCodeLabel" hidden>Authenticator code<input id="authCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6"></label><button class="claim-btn" type="submit" id="authSubmit">Sign in</button></form><div class="auth-links"><button onclick="toggleAuthMode()" id="authToggle">Create account</button><button onclick="requestPasswordReset()">Forgot password?</button><button onclick="closeAuth()">Close</button></div></div></div>
+<div class="enhance-modal" id="authModal"><div class="modal"><h3 id="authTitle">Sign in to WINZA</h3><form class="auth-form" id="authPhoneForm"><label>Phone number<input id="authPhone" type="tel" inputmode="tel" autocomplete="tel" placeholder="080XXXXXXXX" required></label><button class="claim-btn" type="submit" id="authPhoneSubmit">Send code</button></form><form class="auth-form" id="authOtpForm" hidden><label>Enter the 6-digit code sent to <span id="authPhoneDisplay"></span><input id="authOtpCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required></label><div id="authDevCodeNote" hidden style="color:var(--chalk-dim);font-size:12px;margin:-8px 0 8px;"></div><button class="claim-btn" type="submit" id="authOtpSubmit">Verify &amp; continue</button></form><div class="auth-links"><button onclick="closeAuth()">Close</button></div></div></div>
+<div class="enhance-modal" id="kycModal"><div class="modal"><h3>Verify your identity</h3><form class="auth-form" id="kycForm"><label>Full legal name<input id="kycFullName" maxlength="80" required></label><label>Date of birth<input id="kycDob" type="date" required></label><label>ID type<select id="kycIdType" required><option value="">Select…</option><option value="nin">NIN</option><option value="bvn">BVN</option><option value="drivers_license">Driver's License</option><option value="passport">Passport</option><option value="voters_card">Voter's Card</option></select></label><label>ID number<input id="kycIdNumber" maxlength="30" required></label><button class="claim-btn" type="submit" id="kycSubmit">Submit for review</button></form><div class="auth-links"><button onclick="closeKyc()">Close</button></div></div></div>
 
 <div class="modal-overlay" id="modalOverlay">
   <div class="modal" id="modalBox">
@@ -491,6 +492,12 @@
       <div class="label">Your Account Balance</div>
       <div class="amount" id="accountBalance" style="font-size:22px;">Sign in to view</div>
       <div class="settings-card-sub" id="accountBalanceNote" style="margin-top:6px;">Sign in to see your real account balance. This is separate from the play-money demo above.</div>
+    </div>
+    <div class="wallet-balance-card" style="margin-top:-4px;">
+      <div class="label">Identity Verification</div>
+      <div class="amount" id="kycStatusText" style="font-size:18px;">Sign in to view</div>
+      <div class="settings-card-sub" id="kycStatusNote" style="margin-top:6px;"></div>
+      <button class="btn-deposit" id="kycVerifyBtn" style="margin-top:10px;display:none;" onclick="openKyc()">Verify Identity</button>
     </div>
     <div class="wallet-actions">
       <button class="btn-deposit" onclick="openDeposit()">⬇ Deposit</button>
@@ -1241,7 +1248,7 @@
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
     document.getElementById('tab-' + tab).classList.add('active');
     document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-    if (tab === 'wallet') { renderWallet(); refreshServerWallet(); }
+    if (tab === 'wallet') { renderWallet(); refreshServerWallet(); refreshKycStatus(); }
     if (tab === 'profile') renderProfile();
     if (tab === 'leaderboard') renderLeaderboard();
     if (tab === 'settings') renderSettingsToggles();
@@ -1262,14 +1269,30 @@
   };
 
   window.openWithdraw = function() {
-    el.modalTitle.textContent = 'Withdrawals not configured';
+    if (!sessionStorage.getItem('wz_access_token')) { showToast('Sign in first to request a withdrawal.'); return; }
+    el.modalTitle.textContent = 'Request withdrawal';
     el.modalInput.value = '';
     el.modalInput.placeholder = 'Enter amount';
     el.modalOverlay.classList.add('show');
-    el.modalConfirm.onclick = () => {
+    el.modalConfirm.onclick = async () => {
       const amt = Number(el.modalInput.value);
-      if (amt > 0) showToast('Withdrawals need a verified live wallet and compliance review.');
       closeModal();
+      if (!(amt > 0)) return;
+      try {
+        const token = sessionStorage.getItem('wz_access_token');
+        const response = await fetch('/api/v1/wallet/withdrawal-requests', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + token },
+          body: JSON.stringify({ amount: amt }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || 'Unable to submit withdrawal request.');
+        serverWallet = data.wallet;
+        renderAccountWallet();
+        showToast('Withdrawal request submitted for review.');
+      } catch (error) {
+        showToast(error.message);
+      }
     };
   };
 
@@ -1586,9 +1609,8 @@
   window.redeemPromo=()=>{const input=document.getElementById('promoInput'),code=input.value.trim().toUpperCase(),rewards={WELCOME100:1000,WINZA2026:2026,VIP500:500};if(!rewards[code])return showToast('Invalid promo code');if(state.enhance.promoCodes.includes(code))return showToast('Code already redeemed');state.enhance.promoCodes.push(code);state.balance+=rewards[code];addTx('deposit',rewards[code],'Promo '+code);notify('Promo reward credited');input.value='';save();render();renderEnhancements();showToast('Promo applied: ₦'+rewards[code].toLocaleString());};
   window.inviteFriend=()=>{state.enhance.friends++;notify('Friend invitation sent');save();showToast('Invite link copied (demo)');};window.setTheme=(theme)=>{state.enhance.theme=theme;document.body.classList.remove('theme-gold','theme-neon','theme-ocean');if(theme!=='classic')document.body.classList.add('theme-'+theme);save();showToast(theme+' theme applied');};
   // Account UI uses the server API. Local game data remains sandbox-only until wallet migration.
-  let authMode='login';
-  function setAuthMode(mode){authMode=mode;const register=mode==='register';document.getElementById('authTitle').textContent=register?'Create your WINZA account':'Sign in to WINZA';document.getElementById('authNameLabel').hidden=!register;document.getElementById('authName').required=register;document.getElementById('authPassword').autocomplete=register?'new-password':'current-password';document.getElementById('authSubmit').textContent=register?'Create account':'Sign in';document.getElementById('authToggle').textContent=register?'Already have an account? Sign in':'Create account';}
-  window.openAuth=()=>{if(sessionStorage.getItem('wz_access_token')){logoutAccount();return;}setAuthMode('login');document.getElementById('authModal').classList.add('show');};window.closeAuth=()=>document.getElementById('authModal').classList.remove('show');window.toggleAuthMode=()=>setAuthMode(authMode==='login'?'register':'login');
+  let authPhone='';
+  window.openAuth=()=>{if(sessionStorage.getItem('wz_access_token')){logoutAccount();return;}document.getElementById('authTitle').textContent='Sign in to WINZA';document.getElementById('authPhoneForm').hidden=false;document.getElementById('authOtpForm').hidden=true;document.getElementById('authPhone').value='';document.getElementById('authModal').classList.add('show');};window.closeAuth=()=>document.getElementById('authModal').classList.remove('show');
   async function authRequest(endpoint,payload){const response=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Request failed');return data;}
 
   // --- Real account balance (server wallet). Kept fully separate from state.balance,
@@ -1626,33 +1648,72 @@
     renderAccountWallet();
   }
 
+  // --- KYC status. "Not verified" is the default for every new account —
+  // nothing is collected at registration. Whether verification is actually
+  // required before a withdrawal is entirely the backend's call; this card
+  // just reflects whatever status the server reports.
+  let kycStatus = null;
+  function renderKycCard() {
+    const textEl = document.getElementById('kycStatusText');
+    if (!textEl) return;
+    const noteEl = document.getElementById('kycStatusNote');
+    const btn = document.getElementById('kycVerifyBtn');
+    const token = sessionStorage.getItem('wz_access_token');
+    if (!token) { textEl.textContent = 'Sign in to view'; noteEl.textContent = ''; btn.style.display = 'none'; return; }
+    const status = kycStatus || 'not_verified';
+    const labels = { not_verified: 'Not verified', pending: 'Pending review', verified: 'Verified', rejected: 'Rejected' };
+    textEl.textContent = labels[status] || status;
+    if (status === 'not_verified') { noteEl.textContent = 'Required before withdrawing.'; btn.style.display = 'inline-block'; btn.textContent = 'Verify Identity'; }
+    else if (status === 'pending') { noteEl.textContent = 'Your submission is being reviewed.'; btn.style.display = 'none'; }
+    else if (status === 'verified') { noteEl.textContent = 'You can withdraw once payments are enabled.'; btn.style.display = 'none'; }
+    else { noteEl.textContent = 'Your last submission was rejected — you can resubmit.'; btn.style.display = 'inline-block'; btn.textContent = 'Resubmit'; }
+  }
+  async function refreshKycStatus() {
+    const token = sessionStorage.getItem('wz_access_token');
+    if (!token) { kycStatus = null; renderKycCard(); return; }
+    try {
+      const response = await fetch('/api/v1/kyc/me', { headers: { Authorization: 'Bearer ' + token } });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error();
+      kycStatus = data.kycStatus;
+    } catch (e) { kycStatus = null; }
+    renderKycCard();
+  }
+  window.openKyc = () => document.getElementById('kycModal').classList.add('show');
+  window.closeKyc = () => document.getElementById('kycModal').classList.remove('show');
+
   async function logoutAccount() {
     const token = sessionStorage.getItem('wz_access_token');
     sessionStorage.removeItem('wz_access_token');
     document.getElementById('accountBtn').textContent = 'Account';
     serverWallet = null;
+    kycStatus = null;
     renderAccountWallet();
+    renderKycCard();
     showToast('Signed out.');
     if (token) { try { await fetch('/api/v1/auth/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + token } }); } catch (e) {} }
   }
 
   async function restoreSession() {
     const token = sessionStorage.getItem('wz_access_token');
-    if (!token) { renderAccountWallet(); return; }
+    if (!token) { renderAccountWallet(); renderKycCard(); return; }
     try {
       const response = await fetch('/api/v1/auth/me', { headers: { Authorization: 'Bearer ' + token } });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error('Session expired');
       document.getElementById('accountBtn').textContent = data.user.displayName;
       await refreshServerWallet();
+      await refreshKycStatus();
     } catch (error) {
       sessionStorage.removeItem('wz_access_token');
       document.getElementById('accountBtn').textContent = 'Account';
       renderAccountWallet();
+      renderKycCard();
     }
   }
-  document.getElementById('authForm').addEventListener('submit',async event=>{event.preventDefault();const email=document.getElementById('authEmail').value,password=document.getElementById('authPassword').value,button=document.getElementById('authSubmit');button.disabled=true;try{if(authMode==='register'){await authRequest('/api/v1/auth/register',{email,password,displayName:document.getElementById('authName').value});showToast('Account created. Please sign in.');setAuthMode('login');return;}const data=await authRequest('/api/v1/auth/login',{email,password,code:document.getElementById('authCode').value});if(data.mfaRequired){document.getElementById('authCodeLabel').hidden=false;showToast('Enter your authenticator code.');return;}sessionStorage.setItem('wz_access_token',data.accessToken);document.getElementById('accountBtn').textContent=data.user.displayName;closeAuth();showToast('Signed in successfully.');await refreshServerWallet();}catch(error){showToast(error.message);}finally{button.disabled=false;}});
-  window.requestPasswordReset=async()=>{const email=document.getElementById('authEmail').value;if(!email)return showToast('Enter your account email first.');try{await authRequest('/api/v1/auth/password-reset/request',{email});showToast('If the account exists, reset instructions will be sent.');}catch(error){showToast(error.message);}};
+  document.getElementById('authPhoneForm').addEventListener('submit',async event=>{event.preventDefault();const phone=document.getElementById('authPhone').value.trim(),button=document.getElementById('authPhoneSubmit');button.disabled=true;try{const data=await authRequest('/api/v1/auth/otp/request',{phone});authPhone=phone;document.getElementById('authPhoneDisplay').textContent=phone;document.getElementById('authPhoneForm').hidden=true;document.getElementById('authOtpForm').hidden=false;document.getElementById('authTitle').textContent='Enter your code';document.getElementById('authOtpCode').value='';const note=document.getElementById('authDevCodeNote');if(data.devCode){note.hidden=false;note.textContent='Testing mode — no SMS provider configured yet. Code: '+data.devCode;}else{note.hidden=true;}showToast('Code sent.');}catch(error){showToast(error.message);}finally{button.disabled=false;}});
+  document.getElementById('authOtpForm').addEventListener('submit',async event=>{event.preventDefault();const code=document.getElementById('authOtpCode').value.trim(),button=document.getElementById('authOtpSubmit');button.disabled=true;try{const data=await authRequest('/api/v1/auth/otp/verify',{phone:authPhone,code});sessionStorage.setItem('wz_access_token',data.accessToken);document.getElementById('accountBtn').textContent=data.user.displayName;closeAuth();showToast(data.isNewAccount?'Account created — welcome!':'Signed in successfully.');await refreshServerWallet();await refreshKycStatus();}catch(error){showToast(error.message);}finally{button.disabled=false;}});
+  document.getElementById('kycForm').addEventListener('submit',async event=>{event.preventDefault();const button=document.getElementById('kycSubmit');button.disabled=true;try{const token=sessionStorage.getItem('wz_access_token');const response=await fetch('/api/v1/kyc/submit',{method:'POST',headers:{'content-type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({fullName:document.getElementById('kycFullName').value,dateOfBirth:document.getElementById('kycDob').value,idType:document.getElementById('kycIdType').value,idNumber:document.getElementById('kycIdNumber').value})});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Unable to submit.');showToast('Submitted for review.');closeKyc();await refreshKycStatus();}catch(error){showToast(error.message);}finally{button.disabled=false;}});
   setInterval(()=>{liveFeed.unshift({name:FEED_NAMES[Math.floor(Math.random()*FEED_NAMES.length)],text:['won ₦25,000','hit a jackpot','earned VIP Gold','opened a Lucky Box'][Math.floor(Math.random()*4)]});liveFeed=liveFeed.slice(0,8);renderEnhancements();},5500);
   function load() {
     try {

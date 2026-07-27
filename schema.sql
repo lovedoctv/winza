@@ -1,13 +1,21 @@
 -- Apply this to a managed PostgreSQL database before starting WINZA.
 CREATE TABLE users (
   id UUID PRIMARY KEY,
-  email TEXT NOT NULL UNIQUE,
+  email TEXT UNIQUE,
+  phone_number TEXT UNIQUE,
   display_name TEXT NOT NULL,
-  password_hash TEXT NOT NULL,
+  password_hash TEXT,
   role TEXT NOT NULL DEFAULT 'player' CHECK (role IN ('player','support','risk','admin','owner')),
   mfa_secret_encrypted TEXT,
   mfa_pending_secret_encrypted TEXT,
   mfa_enabled_at TIMESTAMPTZ,
+  -- Players register via phone + OTP and start with no KYC data at all;
+  -- verification happens later, only when the backend decides it's required
+  -- (see platform_settings). Staff accounts (support/risk/admin/owner) use
+  -- email + password instead and are provisioned directly, not self-registered.
+  kyc_status TEXT NOT NULL DEFAULT 'not_verified' CHECK (kyc_status IN ('not_verified','pending','verified','rejected')),
+  kyc_reviewed_by UUID REFERENCES users(id),
+  kyc_reviewed_at TIMESTAMPTZ,
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -76,3 +84,42 @@ CREATE TABLE wallet_ledger_entries (
 );
 CREATE INDEX wallet_transactions_wallet_created_idx ON wallet_transactions(wallet_id, created_at DESC);
 CREATE INDEX wallet_ledger_entries_wallet_idx ON wallet_ledger_entries(wallet_id, created_at DESC);
+
+-- One-time codes for phone verification. Stored hashed, single-use, short-lived.
+CREATE TABLE phone_otp_codes (
+  id UUID PRIMARY KEY,
+  phone_number TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX phone_otp_codes_phone_idx ON phone_otp_codes(phone_number, created_at DESC);
+
+-- KYC submissions. Kept separate from users so there's a full history of every
+-- attempt, not just the current status.
+CREATE TABLE kyc_submissions (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  full_name TEXT NOT NULL,
+  date_of_birth DATE NOT NULL,
+  id_type TEXT NOT NULL CHECK (id_type IN ('nin','bvn','drivers_license','passport','voters_card')),
+  id_number TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','verified','rejected')),
+  reviewed_by UUID REFERENCES users(id),
+  reviewed_at TIMESTAMPTZ,
+  rejection_reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX kyc_submissions_user_idx ON kyc_submissions(user_id, created_at DESC);
+CREATE INDEX kyc_submissions_status_idx ON kyc_submissions(status, created_at);
+
+-- Backend-controlled feature flags (e.g. "is KYC required for withdrawal"),
+-- so behavior can change without a redeploy.
+CREATE TABLE platform_settings (
+  key TEXT PRIMARY KEY,
+  value JSONB NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO platform_settings (key, value) VALUES ('kyc_required_for_withdrawal', 'true'::jsonb);

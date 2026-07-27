@@ -1,11 +1,14 @@
 #!/usr/bin/env node
-// Smoke-tests a running WINZA deployment before you open it to testers.
-// Registers a throwaway account, logs in, checks the wallet, and confirms
-// logout actually revokes the session. Doesn't touch real money — there is
-// none to touch yet.
+// Smoke-tests a running WINZA deployment: phone+OTP auth, wallet, the KYC
+// gate on withdrawals, and (optionally) staff approval of a KYC submission.
+// Doesn't touch real money — there is none to touch yet.
 //
 // Usage:
 //   node smoke-test.js https://your-app.onrender.com
+//
+// To also test the admin approval step, provide a staff account created with
+// create-staff-account.js (role must be risk, admin, or owner):
+//   STAFF_EMAIL=you@example.com STAFF_PASSWORD=... node smoke-test.js https://your-app.onrender.com
 
 const BASE_URL = (process.argv[2] || process.env.WINZA_BASE_URL || '').replace(/\/$/, '');
 if (!BASE_URL) {
@@ -20,6 +23,11 @@ function record(name, ok, detail = '') {
   console.log(`${ok ? '✓' : '✗'} ${name}${detail ? ' — ' + detail : ''}`);
 }
 async function json(res) { try { return await res.json(); } catch { return {}; } }
+function randomPhone() {
+  // Nigerian-shaped local number, random enough not to collide between runs.
+  const suffix = String(Date.now()).slice(-8);
+  return '070' + suffix;
+}
 
 async function main() {
   // 1. Server is up and knows about its database.
@@ -36,47 +44,103 @@ async function main() {
   data = await json(res);
   record('GET /api/v1/public/config', res.ok && data.realMoneyEnabled === false, JSON.stringify(data));
 
-  // 3. Register a throwaway account.
-  const email = `smoketest+${Date.now()}@example.com`;
-  const password = 'smoke-test-password-123';
-  res = await fetch(`${BASE_URL}/api/v1/auth/register`, {
+  // 3. Request an OTP for a fresh phone number.
+  const phone = randomPhone();
+  res = await fetch(`${BASE_URL}/api/v1/auth/otp/request`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ email, password, displayName: 'Smoke Test' }),
+    body: JSON.stringify({ phone }),
   });
   data = await json(res);
-  record('POST /api/v1/auth/register', res.status === 201, res.status === 201 ? email : JSON.stringify(data));
-  if (res.status !== 201) return finish();
+  record('POST /api/v1/auth/otp/request', res.status === 202, JSON.stringify(data));
+  if (res.status !== 202) return finish();
+  if (!data.devCode) {
+    record('devCode present (no SMS provider configured)', false, 'Set WINZA_MODE to non-live and leave OTP_SMS_WEBHOOK_URL unset to test this way, or supply the code manually.');
+    return finish();
+  }
 
-  // 4. Log in with it.
-  res = await fetch(`${BASE_URL}/api/v1/auth/login`, {
+  // 4. Verify it — this both registers and logs in on first use.
+  res = await fetch(`${BASE_URL}/api/v1/auth/otp/verify`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ phone, code: data.devCode }),
   });
   data = await json(res);
   const token = data.accessToken;
-  record('POST /api/v1/auth/login', res.ok && Boolean(token), token ? 'token received' : JSON.stringify(data));
+  record('POST /api/v1/auth/otp/verify', res.ok && Boolean(token) && data.isNewAccount === true, token ? 'token received, new account' : JSON.stringify(data));
   if (!token) return finish();
 
-  // 5. Authenticated identity check.
+  // 5. Wrong code on a second request is rejected.
+  res = await fetch(`${BASE_URL}/api/v1/auth/otp/request`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ phone }),
+  });
+  await json(res);
+  res = await fetch(`${BASE_URL}/api/v1/auth/otp/verify`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ phone, code: '000000' }),
+  });
+  record('wrong OTP code rejected (400)', res.status === 400);
+
+  // 6. Identity check: phone present, no KYC fields collected at registration.
   res = await fetch(`${BASE_URL}/api/v1/auth/me`, { headers: { Authorization: `Bearer ${token}` } });
   data = await json(res);
-  record('GET /api/v1/auth/me', res.ok && data.user?.email === email, JSON.stringify(data.user));
+  record('GET /api/v1/auth/me', res.ok && data.user?.phoneNumber === phone && data.user?.kycStatus === 'not_verified', JSON.stringify(data.user));
 
-  // 6. Wallet exists and starts at zero.
+  // 7. Wallet exists and starts at zero.
   res = await fetch(`${BASE_URL}/api/v1/wallet/me`, { headers: { Authorization: `Bearer ${token}` } });
   data = await json(res);
   const w = data.wallet || {};
-  const startsAtZero = Number(w.cashAvailable) === 0 && Number(w.bonusAvailable) === 0 && Number(w.lockedBalance) === 0;
+  const startsAtZero = Number(w.cashAvailable) === 0 && Number(w.bonusAvailable) === 0;
   record('GET /api/v1/wallet/me', res.ok && startsAtZero, JSON.stringify(w));
 
-  // 7. Wrong password is rejected.
-  res = await fetch(`${BASE_URL}/api/v1/auth/login`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ email, password: 'definitely-wrong-password' }),
+  // 8. Withdrawal is blocked before KYC (assuming the default setting is on).
+  res = await fetch(`${BASE_URL}/api/v1/wallet/withdrawal-requests`, {
+    method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ amount: 100 }),
   });
-  record('wrong password rejected (401)', res.status === 401);
+  data = await json(res);
+  record('withdrawal blocked before KYC (403)', res.status === 403, JSON.stringify(data));
 
-  // 8. Logout, then confirm the old token no longer works.
+  // 9. Submit KYC.
+  res = await fetch(`${BASE_URL}/api/v1/kyc/submit`, {
+    method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ fullName: 'Smoke Test', dateOfBirth: '1995-01-01', idType: 'nin', idNumber: '12345678901' }),
+  });
+  data = await json(res);
+  record('POST /api/v1/kyc/submit', res.status === 201, JSON.stringify(data));
+
+  // 10. Status now shows pending.
+  res = await fetch(`${BASE_URL}/api/v1/kyc/me`, { headers: { Authorization: `Bearer ${token}` } });
+  data = await json(res);
+  record('GET /api/v1/kyc/me shows pending', res.ok && data.kycStatus === 'pending', JSON.stringify(data));
+
+  // 11. Optional: staff approval, if credentials were supplied.
+  if (process.env.STAFF_EMAIL && process.env.STAFF_PASSWORD) {
+    res = await fetch(`${BASE_URL}/api/v1/auth/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: process.env.STAFF_EMAIL, password: process.env.STAFF_PASSWORD }),
+    });
+    data = await json(res);
+    const staffToken = data.accessToken;
+    record('staff login', res.ok && Boolean(staffToken));
+    if (staffToken) {
+      res = await fetch(`${BASE_URL}/api/v1/admin/kyc/submissions?status=pending`, { headers: { Authorization: `Bearer ${staffToken}` } });
+      data = await json(res);
+      const submission = (data.submissions || []).find(s => s.phoneNumber === phone);
+      record('admin sees the pending submission', Boolean(submission));
+      if (submission) {
+        res = await fetch(`${BASE_URL}/api/v1/admin/kyc/submissions/${submission.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` }, body: '{}' });
+        record('admin approves the submission', res.ok);
+
+        res = await fetch(`${BASE_URL}/api/v1/kyc/me`, { headers: { Authorization: `Bearer ${token}` } });
+        data = await json(res);
+        record('player now shows verified', res.ok && data.kycStatus === 'verified', JSON.stringify(data));
+      }
+    }
+  } else {
+    console.log('(skipping admin-approval checks — set STAFF_EMAIL/STAFF_PASSWORD to include them)');
+  }
+
+  // 12. Logout, then confirm the old token no longer works.
   res = await fetch(`${BASE_URL}/api/v1/auth/logout`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
   record('POST /api/v1/auth/logout', res.status === 204);
 
