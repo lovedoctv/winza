@@ -357,8 +357,8 @@
       <input type="range" id="adminRtpSlider" min="50" max="95" step="1" value="80">
     </div>
     <div class="admin-config-row">
-      <div class="admin-config-label"><span>Minimum stake</span><strong id="adminMinLabel">₦1,000</strong></div>
-      <input type="range" id="adminMinSlider" min="500" max="10000" step="500" value="1000">
+      <div class="admin-config-label"><span>Minimum stake</span><strong id="adminMinLabel">₦100</strong></div>
+      <input type="range" id="adminMinSlider" min="100" max="10000" step="100" value="100">
     </div>
     <div class="admin-config-row">
       <div class="admin-config-label"><span>Maximum stake</span><strong id="adminMaxLabel">₦50,000</strong></div>
@@ -410,9 +410,10 @@
 
     <div class="risk-panel">
       <div class="risk-row">
-        <div class="risk-label"><span>Stake</span><strong id="stakeLabel">₦1,000</strong></div>
-        <input type="range" id="stakeSlider" min="1000" max="50000" step="1000" value="1000">
+        <div class="risk-label"><span>Stake</span><strong id="stakeLabel">₦100</strong></div>
+        <input type="range" id="stakeSlider" min="100" max="50000" step="100" value="100">
         <div class="preset-chips" id="stakeChips">
+          <span class="chip" data-val="100">₦100</span>
           <span class="chip" data-val="1000">₦1K</span>
           <span class="chip" data-val="5000">₦5K</span>
           <span class="chip" data-val="10000">₦10K</span>
@@ -460,10 +461,10 @@
           <div class="drum-chute"></div>
           <div class="drawn-ball" id="drawnBall"></div>
         </div>
-        <div class="ticket-terms" id="ticketTerms">Stake ₦1,000 → win ₦10,000 · 8.0% chance</div>
+        <div class="ticket-terms" id="ticketTerms">Stake ₦100 → win ₦1,000 · 8.0% chance</div>
         <div class="stamp" id="stamp"></div>
       </div>
-      <button class="buy-btn" id="buyBtn">Spin — ₦1,000</button>
+      <button class="buy-btn" id="buyBtn">Spin — ₦100</button>
       <div class="empty-state" id="emptyState" hidden>
         Out of tokens — that's the deck reset for the day.
         <button id="resetBtn">Refill demo balance</button>
@@ -656,12 +657,12 @@
 
   let state = {
     balance: START_BALANCE, xp: 0, history: [], ticketsBought: 0, totalWon: 0,
-    streak: 0, bestStreak: 0, lastStake: 1000, lastMultiplier: 10, mode: 'wheel',
+    streak: 0, bestStreak: 0, lastStake: 100, lastMultiplier: 10, mode: 'wheel',
     transactions: [], loyaltyPoints: 0, totalWagered: 0,
     referralCode: '', referralCount: 0, referralEarnings: 0,
     playerName: 'Player One', playerId: '', jackpot: 5000000,
     soundEnabled: true, hapticEnabled: true, reducedMotion: false,
-    config: { rtp: 0.8, minStake: 1000, maxStake: 50000, jackpotPct: 0.05 }
+    config: { rtp: 0.8, minStake: 100, maxStake: 50000, jackpotPct: 0.05 }
   };
 
   let isSpinning = false;
@@ -1384,12 +1385,12 @@
     localStorage.removeItem('wz_last_login');
     state = {
       balance: START_BALANCE, xp: 0, history: [], ticketsBought: 0, totalWon: 0,
-      streak: 0, bestStreak: 0, lastStake: 1000, lastMultiplier: 10, mode: 'wheel',
+      streak: 0, bestStreak: 0, lastStake: 100, lastMultiplier: 10, mode: 'wheel',
       transactions: [], loyaltyPoints: 0, totalWagered: 0,
       referralCode: generateReferral(), referralCount: 0, referralEarnings: 0,
       playerName: 'Player One', playerId: randomCode(), jackpot: 5000000,
       soundEnabled: true, hapticEnabled: true, reducedMotion: false,
-      config: { rtp: 0.8, minStake: 1000, maxStake: 50000, jackpotPct: 0.05 },
+      config: { rtp: 0.8, minStake: 100, maxStake: 50000, jackpotPct: 0.05 },
       enhance: {}
     };
     applyMotionPref();
@@ -1800,5 +1801,6 @@
   restoreSession();
 })();
 </script>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a21cd3b63df98645',t:'MTc4NTE2NzcxMQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"1954b47c125f43f8b4338b3c4f804e4f"}' crossorigin="anonymous"></script>
 </body>
 </html>
