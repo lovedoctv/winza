@@ -208,7 +208,12 @@ async function handleAuth(req,res,url,requestId,ip) {
   if (req.method==='POST' && url.pathname==='/api/v1/wallet/withdrawal-requests') {
     const amount=Number(data.amount);
     if (!Number.isFinite(amount) || amount<=0) return fail(res,400,'Enter a valid withdrawal amount.',requestId);
-    const kycRequired=await getSetting('kyc_required_for_withdrawal', true);
+    // In live mode this is non-negotiable — never read from platform_settings,
+    // so nobody can disable the KYC gate on a real-money deployment by
+    // flipping a DB row (there isn't even an admin endpoint that writes this
+    // key, but a direct SQL UPDATE against the database would otherwise still
+    // work). The toggle only exists for sandbox/staging convenience.
+    const kycRequired = MODE==='live' ? true : await getSetting('kyc_required_for_withdrawal', true);
     if (kycRequired && user.kyc_status!=='verified') return fail(res,403,'KYC verification is required before you can withdraw.',requestId);
     const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId);
     try {

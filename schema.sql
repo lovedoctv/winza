@@ -148,6 +148,9 @@ CREATE TABLE platform_settings (
   value JSONB NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Sandbox/staging convenience only. server.js hard-codes this to true and
+-- never reads this row once WINZA_MODE=live, so changing this value has no
+-- effect on a real-money deployment — see the withdrawal-requests handler.
 INSERT INTO platform_settings (key, value) VALUES ('kyc_required_for_withdrawal', 'true'::jsonb);
 
 -- Defense-in-depth for the RTP (Return to Player) floor introduced ahead of
