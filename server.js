@@ -11,6 +11,13 @@ const rtpConfig = require('./rtp-config');
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
 const MODE = process.env.WINZA_MODE || 'sandbox';
+// Separate from WINZA_MODE on purpose: WINZA_MODE stays 'sandbox' all the way
+// through the public Play Store launch (no real money yet), so it can't be
+// what gates a code-in-the-response debug path. This must be explicitly
+// opted into per-deployment and left unset anywhere the app is reachable by
+// real users, or anyone can request an OTP for any phone number and read the
+// code straight back out of the API response.
+const OTP_DEV_ECHO = process.env.OTP_DEV_ECHO === 'true';
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const root = __dirname;
@@ -77,9 +84,9 @@ async function handleAuth(req,res,url,requestId,ip) {
     audit(null,'auth.otp_requested',ip,{phone});
     const payload={ message:'If that number is valid, a verification code has been sent.', requestId };
     // No SMS provider is configured yet. Rather than leave you unable to test
-    // this at all, the code is echoed back here — but ONLY outside live mode.
-    // This branch is structurally impossible once WINZA_MODE is 'live'.
-    if (!delivery.delivered && MODE !== 'live') payload.devCode=code;
+    // this at all, the code can be echoed back here — but only when explicitly
+    // opted into via OTP_DEV_ECHO, and never in live mode regardless.
+    if (!delivery.delivered && MODE !== 'live' && OTP_DEV_ECHO) payload.devCode=code;
     return send(res,202,payload);
   }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/otp/verify') {

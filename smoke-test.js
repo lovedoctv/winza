@@ -9,6 +9,9 @@
 // To also test the admin approval step, provide a staff account created with
 // create-staff-account.js (role must be risk, admin, or owner):
 //   STAFF_EMAIL=you@example.com STAFF_PASSWORD=... node smoke-test.js https://your-app.onrender.com
+//
+// The OTP steps below need the target server to have OTP_DEV_ECHO=true set
+// (dev/staging only — never on a deployment real users can reach).
 
 const BASE_URL = (process.argv[2] || process.env.WINZA_BASE_URL || '').replace(/\/$/, '');
 if (!BASE_URL) {
@@ -56,7 +59,7 @@ async function main() {
   record('POST /api/v1/auth/otp/request', res.status === 202, JSON.stringify(data));
   if (res.status !== 202) return finish();
   if (!data.devCode) {
-    record('devCode present (no SMS provider configured)', false, 'Set WINZA_MODE to non-live and leave OTP_SMS_WEBHOOK_URL unset to test this way, or supply the code manually.');
+    record('devCode present (no SMS provider configured)', false, 'Set OTP_DEV_ECHO=true (and leave OTP_SMS_WEBHOOK_URL unset, WINZA_MODE non-live) on the target server to test this way, or supply the code manually.');
     return finish();
   }
 
