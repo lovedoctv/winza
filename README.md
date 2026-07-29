@@ -67,6 +67,38 @@ row, for every new account. There is still no route that lets anyone adjust a
 balance directly — money only moves through `wallet.postTransaction()`, following
 the same idempotency-key/row-locking/append-only-ledger guarantees as before.
 
+### Deposits (Paystack) — built, but inert until deliberately switched on
+
+`POST /api/v1/wallet/deposits/initiate` and `POST /api/v1/webhooks/paystack`
+exist and are fully wired, but real money still can't move through this app:
+`realMoneyEnabled` in `/api/v1/public/config` is hardcoded `false` regardless
+of any of this, and `winza.html`'s deposit button doesn't call these
+endpoints at all yet. This is the integration built ahead of time, not the
+integration turned on — see "Required before real-money launch" below for
+what still has to happen first.
+
+- `POST /api/v1/wallet/deposits/initiate` — `{ amount }` (₦, min 100).
+  Returns 403 with the same "Payments are unavailable..." message the client
+  already shows unless **both** `WINZA_MODE=live` and `PAYSTACK_SECRET_KEY`
+  are set. When enabled: records a `deposit_intents` row (the reconciliation
+  trail — created before Paystack is even called, so an abandoned checkout
+  still leaves a record), calls Paystack's `transaction/initialize`, and
+  returns `{ authorizationUrl, reference }` for the client to redirect to.
+  Players have no email on file (phone+OTP only); `paystack.js` synthesizes a
+  placeholder one since Paystack requires the field — see its comments.
+- `POST /api/v1/webhooks/paystack` — unauthenticated (Paystack calls this,
+  not a player); the `x-paystack-signature` header's HMAC-SHA512 over the
+  **raw** request body is what proves a request actually came from Paystack.
+  On `charge.success`: looks up the `deposit_intents` row by reference,
+  verifies the webhook's amount matches what was actually initiated (not
+  just trusted from the payload), and credits the wallet via the same
+  idempotent `wallet.postTransaction()` every other balance change goes
+  through — a retried webhook delivery (Paystack does retry) is a no-op, not
+  a double-credit. Any other event type, or a reference that's unknown or
+  already completed, is acknowledged with 200 and otherwise ignored.
+- `PAYSTACK_SECRET_KEY` doubles as the webhook-signing secret — Paystack
+  doesn't issue a separate one. See `.env.example`.
+
 ## KYC
 
 - `GET /api/v1/kyc/me` — current status (`not_verified`/`pending`/`verified`/`rejected`)
@@ -182,12 +214,26 @@ Players always get `player` on registration.
 
 ## Required before real-money launch
 
-- Licensed-jurisdiction rules, age gating, responsible gambling and self-exclusion.
-- Server-side identity/accounts, MFA, sessions, roles and audit logs.
-- Immutable double-entry wallet ledger in a managed database; never LocalStorage.
-- Payment-provider integration with signed webhook validation, idempotency and reconciliation.
-- KYC identity capture and staff review now exist; sanctions screening, fraud/risk limits, and document-photo verification do not yet.
-- Game/RNG certification, reporting, incident response, backups, observability and penetration testing.
+- **A gambling licence for the operating jurisdiction.** Nothing below substitutes for this.
+- Licensed-jurisdiction age gating and responsible-gambling rules — age gating and
+  server-enforced stake limits/cool-off/self-exclusion now exist (see "Responsible
+  gambling" above); jurisdiction-specific licensing requirements on top of that do not.
+- Server-side identity/accounts, MFA, sessions, roles and audit logs — exist.
+- Immutable double-entry wallet ledger in a managed database; never LocalStorage — exists.
+- Payment-provider integration with signed webhook validation, idempotency and
+  reconciliation — **built and tested, but not live**: see "Deposits (Paystack)"
+  above. Still needed before flipping it on: real Paystack credentials tested
+  end-to-end (only verified against a local mock so far), a payout/transfer flow
+  for withdrawals (currently staff-reviewed only, no automated payout), and a
+  reconciliation job for deposit_intents rows that go stuck `pending` (abandoned
+  checkout, dropped webhook).
+- KYC identity capture, staff review, and sanctions/PEP screening now exist (see
+  "KYC" above); document-photo verification does not yet — that needs object
+  storage (an S3-compatible bucket or similar), which isn't part of this pass.
+- Withdrawal fraud/velocity limits now exist (see "Wallet" above).
+- Game/RNG certification, reporting, incident response, backups, observability
+  and penetration testing — none of this exists yet. These are largely external
+  audits and operational processes, not application code.
 
 Do not change `realMoneyEnabled` to true until these systems have been implemented,
 reviewed by the client's compliance and security teams, and approved for the

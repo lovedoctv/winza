@@ -8,6 +8,7 @@ const wallet = require('./wallet');
 const otpLib = require('./otp');
 const rtpConfig = require('./rtp-config');
 const sanctions = require('./sanctions');
+const paystackLib = require('./paystack');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -47,6 +48,11 @@ function throttled(ip) { const now=Date.now(), record=attempts.get(ip)||{count:0
 // when there's no proxy in front (e.g. running locally).
 function clientIp(req) { const forwarded=req.headers['x-forwarded-for']; if (forwarded) return String(forwarded).split(',')[0].trim(); return req.socket.remoteAddress; }
 async function body(req) { return new Promise((resolve,reject)=>{let raw='';req.on('data',c=>{raw+=c;if(raw.length>16_384)req.destroy();});req.on('end',()=>{try{resolve(raw?JSON.parse(raw):{});}catch{reject(new Error('Invalid JSON body'));}});req.on('error',reject);}); }
+// Separate from body() on purpose: webhook signature verification (see
+// paystack.js) must run over the exact raw bytes received, before any JSON
+// parsing — parsing and re-stringifying can reorder keys or change
+// whitespace and silently break an HMAC computed over the original body.
+async function rawBody(req) { return new Promise((resolve,reject)=>{let raw='';req.on('data',c=>{raw+=c;if(raw.length>65_536)req.destroy();});req.on('end',()=>resolve(raw));req.on('error',reject);}); }
 function ready(res, requestId) { if (!pool || !JWT_SECRET || JWT_SECRET.length < 32) { fail(res,503,'Authentication service is not configured.',requestId); return false; } return true; }
 async function sessionFrom(req) { const token=(req.headers.authorization||'').replace(/^Bearer\s+/i,''); const payload=auth.verify(token,JWT_SECRET); const { rows }=await pool.query('SELECT s.id,u.id AS user_id,u.email,u.phone_number,u.display_name,u.role,u.is_active,u.kyc_status FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND s.expires_at>now() AND s.revoked_at IS NULL',[payload.sid]); if(!rows[0]||!rows[0].is_active)throw new Error('Unauthorized'); return rows[0]; }
 function issueSession(user) { const sid=crypto.randomUUID(), expires=new Date(Date.now()+8*60*60_000); return pool.query('INSERT INTO auth_sessions (id,user_id,expires_at) VALUES ($1,$2,$3)',[sid,user.id,expires]).then(()=>({accessToken:auth.sign({sub:user.id,sid,role:user.role},JWT_SECRET,8*60*60),expiresAt:expires.toISOString()})); }
@@ -285,6 +291,34 @@ async function handleAuth(req,res,url,requestId,ip) {
   let user; try { user=await sessionFrom(req); } catch { return fail(res,401,'Authentication required.',requestId); }
   if (req.method==='GET' && url.pathname==='/api/v1/auth/me') return send(res,200,{user:safeUser(user),requestId});
   if (req.method==='GET' && url.pathname==='/api/v1/wallet/me') { const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId); return send(res,200,{wallet:wallet.safeWallet(row),requestId}); }
+
+  // Deposits stay inert everywhere except a fully-configured live
+  // deployment — /api/v1/public/config's realMoneyEnabled is hardcoded
+  // false regardless of this, and winza.html's deposit button doesn't call
+  // this endpoint at all yet. This exists so the integration is built,
+  // tested, and ready, without anything actually moving real money until
+  // that hardcoded flag is deliberately flipped post-launch-checklist.
+  if (req.method==='POST' && url.pathname==='/api/v1/wallet/deposits/initiate') {
+    if (MODE!=='live' || !process.env.PAYSTACK_SECRET_KEY) {
+      return fail(res,403,'Payments are unavailable until the live payment service is configured.',requestId);
+    }
+    const amount=Number(data.amount);
+    if (!Number.isFinite(amount) || amount<100) return fail(res,400,'Enter a valid deposit amount (minimum ₦100).',requestId);
+    const walletRow=await wallet.getWalletByUserId(pool,user.user_id); if(!walletRow)return fail(res,404,'Wallet not found.',requestId);
+    const reference=`winza_dep_${crypto.randomUUID()}`;
+    // Recorded before calling out to Paystack — this is the reconciliation
+    // record the webhook looks up and validates against, not something
+    // trusted to appear only after a webhook says so.
+    await pool.query('INSERT INTO deposit_intents (id,user_id,wallet_id,reference,amount) VALUES ($1,$2,$3,$4,$5)',[crypto.randomUUID(),user.user_id,walletRow.id,reference,amount]);
+    try {
+      const result=await paystackLib.initializeTransaction({ amountNaira:amount, phoneNumber:user.phone_number, reference, callbackUrl:process.env.PAYSTACK_CALLBACK_URL });
+      audit(user.user_id,'wallet.deposit_initiated',ip,{reference,amount});
+      return send(res,200,{ authorizationUrl:result.authorizationUrl, reference, requestId });
+    } catch(e) {
+      await pool.query(`UPDATE deposit_intents SET status='failed' WHERE reference=$1`,[reference]);
+      return fail(res,502,'Unable to start deposit with the payment provider — try again.',requestId);
+    }
+  }
 
   // Withdrawal requests never auto-pay out — they just move funds into
   // pending_withdrawal for staff to review (that review UI is a later step).
@@ -586,12 +620,55 @@ async function handleAdmin(req,res,url,requestId,ip) {
 }
 
 const server = http.createServer(async (req,res) => {
-  const url=new URL(req.url,`http://${req.headers.host||'localhost'}`), requestId=crypto.randomUUID(), ip=req.socket.remoteAddress;
+  // clientIp() specifically exists to resolve to the real caller behind a
+  // reverse proxy (Render, or any other PaaS) via X-Forwarded-For — using
+  // the raw socket address here instead made every request behind such a
+  // proxy look like it came from the same address, silently defeating both
+  // the per-IP throttle and the audit log's IP tracking.
+  const url=new URL(req.url,`http://${req.headers.host||'localhost'}`), requestId=crypto.randomUUID(), ip=clientIp(req);
   res.setHeader('X-Request-Id',requestId);
   try {
     if(req.method==='GET'&&url.pathname==='/healthz')return send(res,200,{ok:true,mode:MODE,databaseConfigured:Boolean(pool),requestId});
     if(req.method==='GET'&&url.pathname==='/api/v1/public/config'){const rtp=await getGameRtp();return send(res,200,{mode:MODE,realMoneyEnabled:false,rtp,rtpMin:rtpConfig.RTP_MIN,rtpMax:rtpConfig.RTP_MAX,message:'Payments and real-money play are disabled until licensed production services are configured.',requestId});}
     if(req.method==='GET'&&url.pathname==='/rtp-config.js')return fs.readFile(path.join(root,'rtp-config.js'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'application/javascript; charset=utf-8'));
+
+    // Unauthenticated by design — Paystack calls this, not a signed-in
+    // player — so the raw body's HMAC signature is the only thing that
+    // proves a request actually came from Paystack. No PAYSTACK_SECRET_KEY
+    // configured means 404 rather than a more specific error, matching how
+    // the rest of this codebase never confirms whether an unauthenticated
+    // feature is configured (see the OTP/password-reset request handlers).
+    if(req.method==='POST'&&url.pathname==='/api/v1/webhooks/paystack'){
+      if(!process.env.PAYSTACK_SECRET_KEY||!pool) return fail(res,404,'Not found',requestId);
+      const raw=await rawBody(req);
+      if(!paystackLib.verifySignature(raw,req.headers['x-paystack-signature'])){
+        audit(null,'webhook.paystack_signature_invalid',ip);
+        return fail(res,401,'Invalid signature.',requestId);
+      }
+      let payload; try{payload=JSON.parse(raw);}catch{return fail(res,400,'Invalid JSON.',requestId);}
+      // Paystack sends many event types on this same webhook — anything
+      // that isn't a successful charge is acknowledged and ignored, not an
+      // error, so Paystack doesn't keep retrying it.
+      if(payload.event!=='charge.success') return send(res,200,{received:true,requestId});
+      const reference=String(payload.data?.reference||'');
+      const amountKobo=Number(payload.data?.amount);
+      const { rows }=await pool.query(`SELECT * FROM deposit_intents WHERE reference=$1 AND status='pending'`,[reference]);
+      const intent=rows[0];
+      // Unknown reference, or one already completed by an earlier delivery
+      // of this same webhook (Paystack retries) — ack without acting, which
+      // is what makes this idempotent rather than double-crediting a wallet.
+      if(!intent) return send(res,200,{received:true,requestId});
+      const expectedKobo=Math.round(Number(intent.amount)*100);
+      if(amountKobo!==expectedKobo){
+        audit(intent.user_id,'webhook.paystack_amount_mismatch',ip,{reference,expectedKobo,amountKobo});
+        return send(res,200,{received:true,requestId});
+      }
+      await wallet.postTransaction(pool,{ walletId:intent.wallet_id, type:'deposit', idempotencyKey:reference, referenceType:'paystack', referenceId:reference, entries:[{balanceType:'cash_available',amount:Number(intent.amount)}] });
+      await pool.query(`UPDATE deposit_intents SET status='completed', completed_at=now() WHERE reference=$1`,[reference]);
+      audit(intent.user_id,'wallet.deposit_completed',ip,{reference,amount:intent.amount});
+      return send(res,200,{received:true,requestId});
+    }
+
     if(url.pathname.startsWith('/api/v1/admin/'))return await handleAdmin(req,res,url,requestId,ip);
     if(url.pathname.startsWith('/api/v1/auth/')||url.pathname.startsWith('/api/v1/wallet/')||url.pathname.startsWith('/api/v1/kyc/')||url.pathname.startsWith('/api/v1/account/'))return await handleAuth(req,res,url,requestId,ip);
     if(req.method==='GET'&&(url.pathname==='/'||url.pathname==='/winza.html'))return fs.readFile(path.join(root,'winza.html'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));
