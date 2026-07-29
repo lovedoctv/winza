@@ -245,6 +245,21 @@
   .btn-danger:hover { background: rgba(232,82,60,0.1); }
   .btn-danger.confirming { background: var(--market-coral); color: var(--chalk); }
   .settings-note { font-size: 11px; color: var(--chalk-dim); text-align: center; margin: 4px 4px 0; line-height: 1.6; }
+  .compliance-links { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+  .compliance-btn { width: 100%; border: 0; border-radius: 9px; background: var(--ijebu-gold); color: var(--ink-night); padding: 11px 12px; font: 700 12px 'Space Grotesk', sans-serif; cursor: pointer; text-align: center; }
+  .lock-banner { display: none; align-items: center; gap: 10px; background: rgba(232,82,60,0.12); border: 1px solid var(--market-coral); border-radius: 12px; padding: 12px 14px; margin-bottom: 14px; font-size: 12px; color: var(--chalk); line-height: 1.5; }
+  .lock-banner.show { display: flex; }
+  .lock-banner b { color: var(--market-coral); }
+  .rg-status { background: var(--ink-night); border-radius: 9px; padding: 10px 12px; font-size: 11px; color: var(--chalk-dim); margin: 10px 0; line-height: 1.6; }
+  .rg-status b { color: var(--chalk); }
+  .rg-option-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .rg-option-row button { flex: 1; min-width: 70px; border: 1px solid var(--plum-line); background: var(--ink-night); color: var(--chalk); border-radius: 8px; padding: 9px 6px; font-size: 11px; cursor: pointer; font-family: 'Space Grotesk', sans-serif; }
+  .rg-option-row button:hover { border-color: var(--ijebu-gold); }
+  .rg-self-exclude { margin-top: 12px; }
+  .legal-body { font-size: 12px; color: var(--chalk-dim); line-height: 1.7; max-height: 55vh; overflow-y: auto; }
+  .legal-body h4 { color: var(--chalk); font-size: 12px; margin: 14px 0 4px; }
+  .legal-body h4:first-child { margin-top: 0; }
+  .legal-body ul { margin: 4px 0; padding-left: 18px; }
   @media (prefers-reduced-motion: reduce) {
     #wheelSvg { transition: transform 0.4s linear; }
     .stamp.show-win, .stamp.show-lose { animation: none; opacity: 1; transform: translate(-50%, -50%) rotate(-8deg) scale(1); }
@@ -319,6 +334,72 @@
 <div class="enhance-modal" id="notificationModal"><div class="modal"><h3>Notification Center</h3><div id="notificationList"></div><button class="btn-cancel" onclick="closeNotifications()">Close</button></div></div>
 <div class="enhance-modal" id="authModal"><div class="modal"><h3 id="authTitle">Sign in to WINZA</h3><form class="auth-form" id="authPhoneForm"><label>Phone number<input id="authPhone" type="tel" inputmode="tel" autocomplete="tel" placeholder="080XXXXXXXX" required></label><div style="color:var(--chalk-dim);font-size:11px;margin:-4px 0 4px;">New here? Just enter your number — your account is created automatically.</div><button class="claim-btn" type="submit" id="authPhoneSubmit">Send code</button></form><form class="auth-form" id="authOtpForm" hidden><label>Enter the 6-digit code sent to <span id="authPhoneDisplay"></span><input id="authOtpCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required></label><div id="authDevCodeNote" hidden style="color:var(--chalk-dim);font-size:12px;margin:-8px 0 8px;"></div><button class="claim-btn" type="submit" id="authOtpSubmit">Verify &amp; continue</button></form><div class="auth-links"><button onclick="closeAuth()">Close</button></div></div></div>
 <div class="enhance-modal" id="kycModal"><div class="modal"><h3>Verify your identity</h3><form class="auth-form" id="kycForm"><label>Full legal name<input id="kycFullName" maxlength="80" required></label><label>Date of birth<input id="kycDob" type="date" required></label><label>ID type<select id="kycIdType" required><option value="">Select…</option><option value="nin">NIN</option><option value="bvn">BVN</option><option value="drivers_license">Driver's License</option><option value="passport">Passport</option><option value="voters_card">Voter's Card</option></select></label><label>ID number<input id="kycIdNumber" maxlength="30" required></label><button class="claim-btn" type="submit" id="kycSubmit">Submit for review</button></form><div class="auth-links"><button onclick="closeKyc()">Close</button></div></div></div>
+
+<div class="enhance-modal" id="rgModal">
+  <div class="modal">
+    <h3>Responsible Gambling</h3>
+    <div class="legal-body">
+      <p>WINZA is currently a play-money sandbox — nothing below moves real funds yet. These are the same tools that will govern your real-money account once licensed play goes live, and your choices carry over.</p>
+    </div>
+    <div class="rg-status" id="rgStatusBox"></div>
+    <h4 style="color:var(--chalk);font-size:12px;margin:12px 0 2px;">Stake limit</h4>
+    <div class="row-head">
+      <input id="rgStakeLimitInput" type="number" min="100" step="100" placeholder="e.g. 5000" style="flex:1">
+      <button class="mini-action" id="rgSetLimitBtn">Set</button>
+    </div>
+    <div class="rg-option-row"><button id="rgClearLimitBtn">Clear stake limit</button></div>
+    <h4 style="color:var(--chalk);font-size:12px;margin:14px 0 2px;">Cool-off (pause play)</h4>
+    <div class="rg-option-row">
+      <button data-hours="24">24 hours</button>
+      <button data-hours="168">7 days</button>
+      <button data-hours="720">30 days</button>
+    </div>
+    <div class="rg-self-exclude">
+      <button class="btn-danger" id="rgSelfExcludeBtn">Self-exclude for 6 months</button>
+    </div>
+    <div class="auth-links"><button onclick="closeRGModal()">Close</button></div>
+  </div>
+</div>
+
+<div class="enhance-modal" id="legalModal">
+  <div class="modal">
+    <h3>Licence &amp; Legal</h3>
+    <div class="legal-body">
+      <h4>Operating status</h4>
+      <p>WINZA is running in <b style="color:var(--chalk)">sandbox/demo mode</b>. No real-money wagers are accepted and no gambling licence has been issued yet. Balances shown across the app are simulated tokens with no cash value.</p>
+      <h4>Before real-money launch</h4>
+      <ul>
+        <li>A gambling licence for each operating jurisdiction, with age verification (18+) enforced at signup.</li>
+        <li>Independent RNG/game certification and regular audits.</li>
+        <li>Segregated player funds and an immutable transaction ledger.</li>
+        <li>Responsible-gambling tooling (limits, cool-off, self-exclusion) enforced server-side, not just client-side.</li>
+      </ul>
+      <h4>Terms</h4>
+      <p>By using this demo you agree it is for entertainment/testing only. Nothing in the app constitutes a real-money gambling service until WINZA publishes a valid licence number for your jurisdiction here.</p>
+    </div>
+    <div class="auth-links"><button onclick="closeLegalModal()">Close</button></div>
+  </div>
+</div>
+
+<div class="enhance-modal" id="privacyModal">
+  <div class="modal">
+    <h3>Privacy (NDPA)</h3>
+    <div class="legal-body">
+      <h4>What we collect</h4>
+      <p>Phone number and OTP verification status, KYC documents you submit for review, gameplay/session data stored on this device (balance, history, preferences), and technical data such as IP address for security.</p>
+      <h4>Your rights under the NDPA</h4>
+      <p>Under Nigeria's Data Protection Act, you can request access to, correction of, or deletion of your personal data, and can withdraw consent for optional processing at any time.</p>
+      <ul>
+        <li><b style="color:var(--chalk)">Access &amp; export</b> — request a copy of the data linked to your account.</li>
+        <li><b style="color:var(--chalk)">Correction</b> — fix inaccurate KYC or profile details.</li>
+        <li><b style="color:var(--chalk)">Deletion</b> — use "Reset all data" for on-device demo data, or request full account deletion.</li>
+      </ul>
+      <h4>Storage</h4>
+      <p>Demo gameplay data lives only in this browser's local storage. Verified-account data (phone, KYC, staff review notes) is stored server-side with restricted staff access.</p>
+    </div>
+    <div class="auth-links"><button onclick="closePrivacyModal()">Close</button></div>
+  </div>
+</div>
 
 <div class="modal-overlay" id="modalOverlay">
   <div class="modal" id="modalBox">
@@ -403,6 +484,7 @@
   </div>
 
   <div class="tab-panel active" id="tab-play">
+    <div class="lock-banner" id="rgLockBanner">🛡️ <span id="rgLockText"></span></div>
     <div class="mode-toggle">
       <button class="mode-btn active" data-mode="wheel">🎡 Wheel</button>
       <button class="mode-btn" data-mode="lotto">🎱 Lotto Drum</button>
@@ -595,7 +677,17 @@
       <button class="btn-danger" id="resetAllBtn">Reset all data</button>
     </div>
 
-    <div class="settings-note">WINZA is a play-money demo. Balances are simulated tokens with no real-world value — nothing here is real currency or a real prize.</div>
+    <div class="settings-card">
+      <h3>🛡️ Compliance &amp; Legal</h3>
+      <div class="settings-card-sub">Licensing, your data rights (NDPA), and responsible-gambling tools (limits, cool-off, self-exclusion).</div>
+      <div class="compliance-links">
+        <button class="compliance-btn" id="rgOpenBtn">Responsible Gambling</button>
+        <button class="compliance-btn" id="legalOpenBtn">Licence &amp; Legal</button>
+        <button class="compliance-btn" id="privacyOpenBtn">Privacy (NDPA)</button>
+      </div>
+    </div>
+
+    <div class="settings-note">WINZA is operating in sandbox/demo mode: balances shown are simulated tokens with no cash value. Licensed real-money play (18+, licensed states only) activates once production services are configured. Please gamble responsibly.</div>
   </div>
 </div>
 
@@ -662,7 +754,8 @@
     referralCode: '', referralCount: 0, referralEarnings: 0,
     playerName: 'Player One', playerId: '', jackpot: 5000000,
     soundEnabled: true, hapticEnabled: true, reducedMotion: false,
-    config: { rtp: 0.8, minStake: 100, maxStake: 50000, jackpotPct: 0.05 }
+    config: { rtp: 0.8, minStake: 100, maxStake: 50000, jackpotPct: 0.05 },
+    rg: { stakeLimit: null, coolOffUntil: null, selfExcludedUntil: null }
   };
 
   let isSpinning = false;
@@ -732,6 +825,19 @@
     hapticToggle: document.getElementById('hapticToggle'),
     motionToggle: document.getElementById('motionToggle'),
     resetAllBtn: document.getElementById('resetAllBtn'),
+    rgOpenBtn: document.getElementById('rgOpenBtn'),
+    legalOpenBtn: document.getElementById('legalOpenBtn'),
+    privacyOpenBtn: document.getElementById('privacyOpenBtn'),
+    rgModal: document.getElementById('rgModal'),
+    legalModal: document.getElementById('legalModal'),
+    privacyModal: document.getElementById('privacyModal'),
+    rgStatusBox: document.getElementById('rgStatusBox'),
+    rgStakeLimitInput: document.getElementById('rgStakeLimitInput'),
+    rgSetLimitBtn: document.getElementById('rgSetLimitBtn'),
+    rgClearLimitBtn: document.getElementById('rgClearLimitBtn'),
+    rgSelfExcludeBtn: document.getElementById('rgSelfExcludeBtn'),
+    rgLockBanner: document.getElementById('rgLockBanner'),
+    rgLockText: document.getElementById('rgLockText'),
     brandLogo: document.getElementById('brandLogo'),
     adminOverlay: document.getElementById('adminOverlay'),
     adminExitBtn: document.getElementById('adminExitBtn'),
@@ -1180,10 +1286,21 @@
 
   async function buyTicket() {
     if (isSpinning) return;
+    const lock = rgLockState();
+    if (lock.locked) {
+      showToast(lock.reason === 'self-excluded'
+        ? `Self-excluded for ${fmtRemaining(lock.until - Date.now())} more — play is paused`
+        : `Cool-off active for ${fmtRemaining(lock.until - Date.now())} more — play is paused`);
+      return;
+    }
     initAudio();
     const stake = currentStake();
     const mult = currentMultiplier();
     if (state.balance < stake) return;
+    if (state.rg.stakeLimit && stake > state.rg.stakeLimit) {
+      showToast(`Stake limit is ₦${state.rg.stakeLimit.toLocaleString()} per spin — lower your stake or update it in Settings`);
+      return;
+    }
     isSpinning = true;
     state.lastStake = stake;
     state.lastMultiplier = mult;
@@ -1391,6 +1508,7 @@
       playerName: 'Player One', playerId: randomCode(), jackpot: 5000000,
       soundEnabled: true, hapticEnabled: true, reducedMotion: false,
       config: { rtp: 0.8, minStake: 100, maxStake: 50000, jackpotPct: 0.05 },
+      rg: { stakeLimit: null, coolOffUntil: null, selfExcludedUntil: null },
       enhance: {}
     };
     applyMotionPref();
@@ -1408,6 +1526,114 @@
     save();
     showToast('All data reset — fresh start at ₦50,000');
   }
+
+  // --- Responsible gambling: stake limits, cool-off, self-exclusion ---
+  function fmtRemaining(ms) {
+    const mins = Math.ceil(ms / 60000);
+    if (mins <= 60) return mins + ' min' + (mins === 1 ? '' : 's');
+    const hours = Math.ceil(ms / 3600000);
+    if (hours <= 48) return hours + ' hour' + (hours === 1 ? '' : 's');
+    const days = Math.ceil(ms / 86400000);
+    return days + ' day' + (days === 1 ? '' : 's');
+  }
+
+  function rgLockState() {
+    const now = Date.now();
+    if (state.rg.selfExcludedUntil && now < state.rg.selfExcludedUntil) {
+      return { locked: true, reason: 'self-excluded', until: state.rg.selfExcludedUntil };
+    }
+    if (state.rg.coolOffUntil && now < state.rg.coolOffUntil) {
+      return { locked: true, reason: 'cool-off', until: state.rg.coolOffUntil };
+    }
+    return { locked: false };
+  }
+
+  function renderRGLockBanner() {
+    const lock = rgLockState();
+    if (!lock.locked) { el.rgLockBanner.classList.remove('show'); return; }
+    const remaining = fmtRemaining(lock.until - Date.now());
+    el.rgLockText.innerHTML = lock.reason === 'self-excluded'
+      ? `You're self-excluded. Play is paused for <b>${remaining}</b> more.`
+      : `Cool-off active. Play is paused for <b>${remaining}</b> more.`;
+    el.rgLockBanner.classList.add('show');
+  }
+
+  function renderRGStatus() {
+    const lock = rgLockState();
+    const lines = [];
+    lines.push(state.rg.stakeLimit
+      ? `Stake limit: <b>₦${state.rg.stakeLimit.toLocaleString()}</b> per spin`
+      : 'Stake limit: <b>none set</b>');
+    if (lock.locked && lock.reason === 'cool-off') {
+      lines.push(`Cool-off: <b>active</b>, ${fmtRemaining(lock.until - Date.now())} remaining`);
+    } else {
+      lines.push('Cool-off: <b>not active</b>');
+    }
+    if (lock.locked && lock.reason === 'self-excluded') {
+      lines.push(`Self-exclusion: <b>active</b>, ${fmtRemaining(lock.until - Date.now())} remaining`);
+    } else {
+      lines.push('Self-exclusion: <b>not active</b>');
+    }
+    el.rgStatusBox.innerHTML = lines.join('<br>');
+    el.rgStakeLimitInput.value = state.rg.stakeLimit || '';
+  }
+
+  function openRGModal() { renderRGStatus(); el.rgModal.classList.add('show'); }
+  window.closeRGModal = function () { el.rgModal.classList.remove('show'); };
+  function openLegalModal() { el.legalModal.classList.add('show'); }
+  window.closeLegalModal = function () { el.legalModal.classList.remove('show'); };
+  function openPrivacyModal() { el.privacyModal.classList.add('show'); }
+  window.closePrivacyModal = function () { el.privacyModal.classList.remove('show'); };
+
+  el.rgOpenBtn.addEventListener('click', openRGModal);
+  el.legalOpenBtn.addEventListener('click', openLegalModal);
+  el.privacyOpenBtn.addEventListener('click', openPrivacyModal);
+
+  el.rgSetLimitBtn.addEventListener('click', () => {
+    const val = Number(el.rgStakeLimitInput.value);
+    if (!val || val < 100) { showToast('Enter a stake limit of at least ₦100'); return; }
+    state.rg.stakeLimit = val;
+    save();
+    renderRGStatus();
+    showToast(`Stake limit set to ₦${val.toLocaleString()} per spin`);
+  });
+  el.rgClearLimitBtn.addEventListener('click', () => {
+    state.rg.stakeLimit = null;
+    save();
+    renderRGStatus();
+    showToast('Stake limit cleared');
+  });
+  document.querySelectorAll('#rgModal .rg-option-row button[data-hours]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const hours = Number(btn.dataset.hours);
+      state.rg.coolOffUntil = Date.now() + hours * 3600000;
+      save();
+      renderRGStatus();
+      renderRGLockBanner();
+      showToast(`Cool-off started — play is paused for ${fmtRemaining(hours * 3600000)}`);
+      closeRGModal();
+    });
+  });
+  let selfExcludeConfirming = false;
+  el.rgSelfExcludeBtn.addEventListener('click', () => {
+    if (!selfExcludeConfirming) {
+      selfExcludeConfirming = true;
+      el.rgSelfExcludeBtn.textContent = 'Tap again to confirm — pauses play for 6 months';
+      setTimeout(() => {
+        selfExcludeConfirming = false;
+        el.rgSelfExcludeBtn.textContent = 'Self-exclude for 6 months';
+      }, 4000);
+      return;
+    }
+    selfExcludeConfirming = false;
+    el.rgSelfExcludeBtn.textContent = 'Self-exclude for 6 months';
+    state.rg.selfExcludedUntil = Date.now() + 180 * 86400000;
+    save();
+    renderRGStatus();
+    renderRGLockBanner();
+    showToast('Self-exclusion started — play is paused for 6 months');
+    closeRGModal();
+  });
 
   function applyStakeBounds() {
     el.stakeSlider.min = state.config.minStake;
@@ -1773,6 +1999,7 @@
     state.config = Object.assign({ rtp: 0.8, minStake: 100, maxStake: 50000, jackpotPct: 0.05 }, state.config || {});
     state.config.minStake = 100;
     state.config.maxStake = 50000;
+    state.rg = Object.assign({ stakeLimit: null, coolOffUntil: null, selfExcludedUntil: null }, state.rg || {});
     if (!state.playerId) state.playerId = randomCode();
     if (!state.referralCode) state.referralCode = generateReferral();
     renderSettingsToggles();
@@ -1786,6 +2013,7 @@
       el.wheelWrap.style.display = 'none';
       el.lottoDrum.style.display = '';
     }
+    renderRGLockBanner();
     render();
   }
 
@@ -1800,6 +2028,7 @@
   });
 
   load();
+  setInterval(renderRGLockBanner, 30000);
   setupEnhancements();
   checkDailyBonus();
   restoreSession();
