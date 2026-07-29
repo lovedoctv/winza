@@ -1585,6 +1585,10 @@
     lines.push(state.rg.stakeLimit
       ? `Stake limit: <b>₦${state.rg.stakeLimit.toLocaleString()}</b> per spin`
       : 'Stake limit: <b>none set</b>');
+    if (state.rg.pendingStakeLimitEffectiveAt) {
+      const pendingText = state.rg.pendingStakeLimit ? '₦' + state.rg.pendingStakeLimit.toLocaleString() : 'no limit';
+      lines.push(`Pending change: <b>${pendingText}</b> — effective ${new Date(state.rg.pendingStakeLimitEffectiveAt).toLocaleString()}`);
+    }
     if (lock.locked && lock.reason === 'cool-off') {
       lines.push(`Cool-off: <b>active</b>, ${fmtRemaining(lock.until - Date.now())} remaining`);
     } else {
@@ -1599,7 +1603,27 @@
     el.rgStakeLimitInput.value = state.rg.stakeLimit || '';
   }
 
-  function openRGModal() { renderRGStatus(); el.rgModal.classList.add('show'); }
+  // Server is the source of truth once signed in — self-exclusion and
+  // cool-off used to live only in localStorage, which meant clearing site
+  // data silently undid them. Pulling fresh state every time the panel opens
+  // also picks up a scheduled stake-limit change once it's taken effect.
+  async function syncRGFromServer() {
+    const token = sessionStorage.getItem('wz_access_token');
+    if (!token) return;
+    try {
+      const response = await fetch('/api/v1/account/limits', { headers: { Authorization: 'Bearer ' + token } });
+      if (!response.ok) return;
+      const data = await response.json();
+      const l = data.limits;
+      state.rg.stakeLimit = l.dailyStakeLimit;
+      state.rg.coolOffUntil = l.coolOffUntil ? new Date(l.coolOffUntil).getTime() : null;
+      state.rg.selfExcludedUntil = l.selfExcludedUntil ? new Date(l.selfExcludedUntil).getTime() : null;
+      state.rg.pendingStakeLimit = l.pendingDailyStakeLimit;
+      state.rg.pendingStakeLimitEffectiveAt = l.pendingEffectiveAt ? new Date(l.pendingEffectiveAt).getTime() : null;
+      save();
+    } catch (e) {}
+  }
+  async function openRGModal() { await syncRGFromServer(); renderRGStatus(); el.rgModal.classList.add('show'); }
   window.closeRGModal = function () { el.rgModal.classList.remove('show'); };
   function openLegalModal() { el.legalModal.classList.add('show'); }
   window.closeLegalModal = function () { el.legalModal.classList.remove('show'); };
@@ -1610,23 +1634,71 @@
   el.legalOpenBtn.addEventListener('click', openLegalModal);
   el.privacyOpenBtn.addEventListener('click', openPrivacyModal);
 
-  el.rgSetLimitBtn.addEventListener('click', () => {
+  // Signs the current device out locally after the server has revoked the
+  // session, so the UI can't keep acting as if it's still authenticated.
+  function forceLocalSignOut() {
+    sessionStorage.removeItem('wz_access_token');
+    currentAccountUser = null;
+    renderAccountUI();
+  }
+
+  el.rgSetLimitBtn.addEventListener('click', async () => {
     const val = Number(el.rgStakeLimitInput.value);
     if (!val || val < 100) { showToast('Enter a stake limit of at least ₦100'); return; }
+    const token = sessionStorage.getItem('wz_access_token');
+    if (token) {
+      try {
+        const response = await fetch('/api/v1/account/limits/stake', { method: 'PUT', headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + token }, body: JSON.stringify({ dailyStakeLimit: val }) });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || 'Unable to update stake limit.');
+        await syncRGFromServer();
+        renderRGStatus();
+        showToast(data.message);
+      } catch (e) { showToast(e.message); }
+      return;
+    }
     state.rg.stakeLimit = val;
     save();
     renderRGStatus();
     showToast(`Stake limit set to ₦${val.toLocaleString()} per spin`);
   });
-  el.rgClearLimitBtn.addEventListener('click', () => {
+  el.rgClearLimitBtn.addEventListener('click', async () => {
+    const token = sessionStorage.getItem('wz_access_token');
+    if (token) {
+      try {
+        const response = await fetch('/api/v1/account/limits/stake', { method: 'PUT', headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + token }, body: JSON.stringify({ dailyStakeLimit: null }) });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || 'Unable to clear stake limit.');
+        await syncRGFromServer();
+        renderRGStatus();
+        showToast(data.message);
+      } catch (e) { showToast(e.message); }
+      return;
+    }
     state.rg.stakeLimit = null;
     save();
     renderRGStatus();
     showToast('Stake limit cleared');
   });
   document.querySelectorAll('#rgModal .rg-option-row button[data-hours]').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const hours = Number(btn.dataset.hours);
+      const token = sessionStorage.getItem('wz_access_token');
+      if (token) {
+        try {
+          const response = await fetch('/api/v1/account/limits/cool-off', { method: 'POST', headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + token }, body: JSON.stringify({ hours }) });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.error || 'Unable to start cool-off.');
+          state.rg.coolOffUntil = Date.now() + hours * 3600000;
+          save();
+          renderRGStatus();
+          renderRGLockBanner();
+          showToast(`Cool-off started — play is paused for ${fmtRemaining(hours * 3600000)}`);
+          closeRGModal();
+          forceLocalSignOut();
+        } catch (e) { showToast(e.message); }
+        return;
+      }
       state.rg.coolOffUntil = Date.now() + hours * 3600000;
       save();
       renderRGStatus();
@@ -1636,7 +1708,7 @@
     });
   });
   let selfExcludeConfirming = false;
-  el.rgSelfExcludeBtn.addEventListener('click', () => {
+  el.rgSelfExcludeBtn.addEventListener('click', async () => {
     if (!selfExcludeConfirming) {
       selfExcludeConfirming = true;
       el.rgSelfExcludeBtn.textContent = 'Tap again to confirm — pauses play for 6 months';
@@ -1648,6 +1720,22 @@
     }
     selfExcludeConfirming = false;
     el.rgSelfExcludeBtn.textContent = 'Self-exclude for 6 months';
+    const token = sessionStorage.getItem('wz_access_token');
+    if (token) {
+      try {
+        const response = await fetch('/api/v1/account/limits/self-exclude', { method: 'POST', headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + token }, body: '{}' });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || 'Unable to start self-exclusion.');
+        state.rg.selfExcludedUntil = Date.now() + 180 * 86400000;
+        save();
+        renderRGStatus();
+        renderRGLockBanner();
+        showToast('Self-exclusion started — play is paused for 6 months');
+        closeRGModal();
+        forceLocalSignOut();
+      } catch (e) { showToast(e.message); }
+      return;
+    }
     state.rg.selfExcludedUntil = Date.now() + 180 * 86400000;
     save();
     renderRGStatus();

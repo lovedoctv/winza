@@ -98,6 +98,46 @@ async function main() {
   const startsAtZero = Number(w.cashAvailable) === 0 && Number(w.bonusAvailable) === 0;
   record('GET /api/v1/wallet/me', res.ok && startsAtZero, JSON.stringify(w));
 
+  // Responsible-gambling limits: server-enforced stake-limit scheduling and
+  // self-exclusion blocking login. Uses its own throwaway account since
+  // self-exclusion can't be undone — reusing `token`/`phone` here would
+  // permanently lock the account used by every step below this one.
+  {
+    const { raw: rgPhone } = randomPhone();
+    res = await fetch(`${BASE_URL}/api/v1/auth/otp/request`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: rgPhone }) });
+    data = await json(res);
+    if (data.devCode) {
+      res = await fetch(`${BASE_URL}/api/v1/auth/otp/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: rgPhone, code: data.devCode }) });
+      data = await json(res);
+      const rgToken = data.accessToken;
+      if (rgToken) {
+        res = await fetch(`${BASE_URL}/api/v1/account/limits/stake`, { method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${rgToken}` }, body: JSON.stringify({ dailyStakeLimit: 1000 }) });
+        data = await json(res);
+        record('PUT stake limit (first time, applies immediately)', res.ok && data.limits?.dailyStakeLimit === 1000, JSON.stringify(data));
+
+        res = await fetch(`${BASE_URL}/api/v1/account/limits/stake`, { method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${rgToken}` }, body: JSON.stringify({ dailyStakeLimit: 5000 }) });
+        data = await json(res);
+        record('loosening a stake limit is scheduled, not immediate', res.ok && data.limits?.dailyStakeLimit === 1000 && data.limits?.pendingDailyStakeLimit === 5000, JSON.stringify(data));
+
+        res = await fetch(`${BASE_URL}/api/v1/account/limits/self-exclude`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${rgToken}` }, body: '{}' });
+        record('POST /api/v1/account/limits/self-exclude', res.ok);
+
+        res = await fetch(`${BASE_URL}/api/v1/auth/me`, { headers: { Authorization: `Bearer ${rgToken}` } });
+        record('session revoked immediately after self-exclusion', res.status === 401);
+
+        res = await fetch(`${BASE_URL}/api/v1/auth/otp/request`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: rgPhone }) });
+        data = await json(res);
+        if (data.devCode) {
+          res = await fetch(`${BASE_URL}/api/v1/auth/otp/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: rgPhone, code: data.devCode }) });
+          data = await json(res);
+          record('login blocked after self-exclusion (403)', res.status === 403 && /self-exclusion/i.test(data.error || ''), JSON.stringify(data));
+        }
+      }
+    } else {
+      console.log('(skipping responsible-gambling checks — needs OTP_DEV_ECHO=true on the target server)');
+    }
+  }
+
   // 8. Withdrawal is blocked before KYC (assuming the default setting is on).
   res = await fetch(`${BASE_URL}/api/v1/wallet/withdrawal-requests`, {
     method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },

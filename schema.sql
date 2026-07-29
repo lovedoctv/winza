@@ -141,6 +141,24 @@ CREATE TABLE phone_recovery_requests (
 CREATE INDEX phone_recovery_requests_status_idx ON phone_recovery_requests(status, created_at);
 CREATE INDEX phone_recovery_requests_user_idx ON phone_recovery_requests(user_id, created_at DESC);
 
+-- Server-enforced responsible-gambling limits. Previously this lived only in
+-- the browser's localStorage, which meant clearing site data or switching
+-- devices silently undid a self-exclusion or cool-off — exactly the failure
+-- mode these controls are supposed to be immune to. See server.js: OTP login
+-- and withdrawal requests both check this table now.
+CREATE TABLE player_limits (
+  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  daily_stake_limit NUMERIC(18,2),
+  -- Loosening or removing a limit is deferred 24h (see server.js) so it
+  -- can't be undone in the same moment of impulse that prompted it.
+  -- Tightening a limit, or setting one for the first time, is immediate.
+  pending_daily_stake_limit NUMERIC(18,2),
+  pending_stake_limit_effective_at TIMESTAMPTZ,
+  cool_off_until TIMESTAMPTZ,
+  self_excluded_until TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Backend-controlled feature flags (e.g. "is KYC required for withdrawal"),
 -- so behavior can change without a redeploy.
 CREATE TABLE platform_settings (

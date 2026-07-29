@@ -67,9 +67,56 @@ async function getGameRtp() {
 }
 function ageFromDob(dobStr) { const dob=new Date(dobStr+'T00:00:00Z'); if(Number.isNaN(dob.getTime()))return 0; const now=new Date(); let age=now.getUTCFullYear()-dob.getUTCFullYear(); const m=now.getUTCMonth()-dob.getUTCMonth(); if(m<0||(m===0&&now.getUTCDate()<dob.getUTCDate()))age--; return age; }
 
+// Responsible-gambling limits, read fresh on every login/withdrawal attempt
+// rather than cached anywhere client-side. If a scheduled stake-limit
+// loosening/removal has come due, applies it here so every caller sees the
+// current, correct value without a separate cron job.
+async function getEffectiveLimits(userId) {
+  const { rows } = await pool.query('SELECT * FROM player_limits WHERE user_id=$1',[userId]);
+  let row = rows[0];
+  if (row && row.pending_daily_stake_limit !== null && row.pending_stake_limit_effective_at && new Date(row.pending_stake_limit_effective_at) <= new Date()) {
+    const updated = await pool.query('UPDATE player_limits SET daily_stake_limit=$1, pending_daily_stake_limit=NULL, pending_stake_limit_effective_at=NULL, updated_at=now() WHERE user_id=$2 RETURNING *',[row.pending_daily_stake_limit, userId]);
+    row = updated.rows[0];
+  }
+  return row || null;
+}
+function safeLimits(row) {
+  if (!row) return { dailyStakeLimit:null, pendingDailyStakeLimit:null, pendingEffectiveAt:null, coolOffUntil:null, selfExcludedUntil:null };
+  return {
+    dailyStakeLimit: row.daily_stake_limit===null?null:Number(row.daily_stake_limit),
+    pendingDailyStakeLimit: row.pending_daily_stake_limit===null?null:Number(row.pending_daily_stake_limit),
+    pendingEffectiveAt: row.pending_stake_limit_effective_at,
+    coolOffUntil: row.cool_off_until,
+    selfExcludedUntil: row.self_excluded_until,
+  };
+}
+// Self-exclusion and cool-off are checked at the two points that matter most
+// given there's no server-mediated wagering endpoint yet (gameplay itself is
+// still a client-side simulation, see README): logging in at all, and
+// withdrawing funds. Neither can be reversed early through this app — that's
+// the point of a cooling-off period.
+function restrictionFromLimits(row) {
+  if (!row) return null;
+  const now = Date.now();
+  if (row.self_excluded_until && new Date(row.self_excluded_until).getTime() > now) return { type:'self_exclusion', until:row.self_excluded_until };
+  if (row.cool_off_until && new Date(row.cool_off_until).getTime() > now) return { type:'cool_off', until:row.cool_off_until };
+  return null;
+}
+function restrictionMessage(restriction) {
+  return restriction.type==='self_exclusion'
+    ? `Self-exclusion is active until ${new Date(restriction.until).toISOString()}. This cannot be reversed early.`
+    : `Cool-off is active until ${new Date(restriction.until).toISOString()}.`;
+}
+
 async function handleAuth(req,res,url,requestId,ip) {
   if (!ready(res,requestId)) return;
-  if (throttled(ip)) return fail(res,429,'Too many attempts. Try again later.',requestId);
+  // Scoped to state-changing/credential-testing requests (OTP, login,
+  // password reset, mutations) — not read-only GETs. A GET under an already-
+  // valid session (checking your own balance, KYC status, limits) isn't a
+  // brute-force vector and shouldn't share a budget with the traffic this
+  // exists to slow down; gating it too just means a normal multi-action
+  // session behind a shared IP/proxy can lock itself out.
+  if (req.method!=='GET' && throttled(ip)) return fail(res,429,'Too many attempts. Try again later.',requestId);
   const data=await body(req);
 
   // --- Phone + OTP: this is the only way players register or log in now.
@@ -118,6 +165,16 @@ async function handleAuth(req,res,url,requestId,ip) {
       await client.query('COMMIT');
     } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
     if (!user.is_active) return fail(res,403,'This account has been disabled.',requestId);
+    // A brand-new account can't have a player_limits row yet, so this only
+    // ever blocks a returning player — which is exactly who self-exclusion
+    // and cool-off are for.
+    if (!isNewAccount) {
+      const restriction=restrictionFromLimits(await getEffectiveLimits(user.id));
+      if (restriction) {
+        audit(user.id, restriction.type==='self_exclusion'?'auth.login_blocked_self_exclusion':'auth.login_blocked_cool_off', ip);
+        return fail(res,403,restrictionMessage(restriction),requestId);
+      }
+    }
     const session=await issueSession(user);
     audit(user.id, isNewAccount?'account.registered_via_otp':'auth.login_succeeded', ip);
     return send(res,200,{ user:safeUser(user), isNewAccount, ...session, requestId });
@@ -215,6 +272,11 @@ async function handleAuth(req,res,url,requestId,ip) {
     // work). The toggle only exists for sandbox/staging convenience.
     const kycRequired = MODE==='live' ? true : await getSetting('kyc_required_for_withdrawal', true);
     if (kycRequired && user.kyc_status!=='verified') return fail(res,403,'KYC verification is required before you can withdraw.',requestId);
+    // Defense-in-depth alongside the login-time check: a session issued just
+    // before a self-exclusion or cool-off started is still valid for up to 8
+    // hours (see issueSession), so withdrawals need their own check too.
+    const restriction=restrictionFromLimits(await getEffectiveLimits(user.user_id));
+    if (restriction) return fail(res,403,restrictionMessage(restriction),requestId);
     const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId);
     try {
       const result=await wallet.postTransaction(pool,{ walletId:row.id, type:'withdrawal_request', idempotencyKey:data.idempotencyKey||crypto.randomUUID(), referenceType:'withdrawal', entries:[{balanceType:'cash_available',amount:-amount},{balanceType:'pending_withdrawal',amount}] });
@@ -247,6 +309,58 @@ async function handleAuth(req,res,url,requestId,ip) {
     audit(user.user_id,'kyc.submitted',ip);
     return send(res,201,{ message:'Submitted for review.', requestId });
   }
+
+  if (req.method==='GET' && url.pathname==='/api/v1/account/limits') {
+    return send(res,200,{ limits: safeLimits(await getEffectiveLimits(user.user_id)), requestId });
+  }
+  if (req.method==='PUT' && url.pathname==='/api/v1/account/limits/stake') {
+    const raw=data.dailyStakeLimit;
+    const newLimit = raw===null||raw===undefined||raw==='' ? null : Number(raw);
+    if (newLimit!==null && (!Number.isFinite(newLimit) || newLimit<=0)) return fail(res,400,'Enter a valid stake limit, or null to remove it.',requestId);
+    const current=await getEffectiveLimits(user.user_id);
+    const currentLimit = current && current.daily_stake_limit!==null ? Number(current.daily_stake_limit) : null;
+    // Tightening a limit (or setting one for the first time) protects the
+    // player, so it applies immediately. Loosening or removing one is
+    // exactly the kind of impulsive decision these controls exist to slow
+    // down, so it's deferred 24 hours instead.
+    const isLoosening = currentLimit!==null && (newLimit===null || newLimit>currentLimit);
+    if (isLoosening) {
+      await pool.query(`INSERT INTO player_limits (user_id, daily_stake_limit, pending_daily_stake_limit, pending_stake_limit_effective_at, updated_at) VALUES ($1,$2,$3, now() + interval '24 hours', now())
+        ON CONFLICT (user_id) DO UPDATE SET pending_daily_stake_limit=$3, pending_stake_limit_effective_at=now()+interval '24 hours', updated_at=now()`,[user.user_id, currentLimit, newLimit]);
+      audit(user.user_id,'account.stake_limit_change_scheduled',ip,{newLimit});
+      return send(res,200,{ message:'Change scheduled — takes effect in 24 hours.', limits: safeLimits(await getEffectiveLimits(user.user_id)), requestId });
+    }
+    await pool.query(`INSERT INTO player_limits (user_id, daily_stake_limit, pending_daily_stake_limit, pending_stake_limit_effective_at, updated_at) VALUES ($1,$2,NULL,NULL,now())
+      ON CONFLICT (user_id) DO UPDATE SET daily_stake_limit=$2, pending_daily_stake_limit=NULL, pending_stake_limit_effective_at=NULL, updated_at=now()`,[user.user_id,newLimit]);
+    audit(user.user_id,'account.stake_limit_updated',ip,{newLimit});
+    return send(res,200,{ message:'Stake limit updated.', limits: safeLimits(await getEffectiveLimits(user.user_id)), requestId });
+  }
+  if (req.method==='POST' && url.pathname==='/api/v1/account/limits/cool-off') {
+    const hours=Number(data.hours);
+    if (!Number.isFinite(hours) || hours<24 || hours>720) return fail(res,400,'Cool-off must be between 24 and 720 hours.',requestId);
+    const current=await getEffectiveLimits(user.user_id);
+    const proposedUntil=new Date(Date.now()+hours*3600000);
+    // Same no-early-reversal principle as self-exclusion, just for a shorter,
+    // player-chosen window: cool-off can be extended but never shortened
+    // once active.
+    if (current && current.cool_off_until && new Date(current.cool_off_until)>proposedUntil) {
+      return fail(res,400,'An active cool-off cannot be shortened.',requestId);
+    }
+    await pool.query(`INSERT INTO player_limits (user_id, cool_off_until, updated_at) VALUES ($1,$2,now())
+      ON CONFLICT (user_id) DO UPDATE SET cool_off_until=$2, updated_at=now()`,[user.user_id, proposedUntil]);
+    await pool.query('UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL',[user.user_id]);
+    audit(user.user_id,'account.cool_off_started',ip,{hours});
+    return send(res,200,{ message:'Cool-off started. You have been signed out and cannot log back in until it ends.', coolOffUntil:proposedUntil.toISOString(), requestId });
+  }
+  if (req.method==='POST' && url.pathname==='/api/v1/account/limits/self-exclude') {
+    const until=new Date(Date.now()+180*86400000);
+    await pool.query(`INSERT INTO player_limits (user_id, self_excluded_until, updated_at) VALUES ($1,$2,now())
+      ON CONFLICT (user_id) DO UPDATE SET self_excluded_until=$2, updated_at=now()`,[user.user_id, until]);
+    await pool.query('UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL',[user.user_id]);
+    audit(user.user_id,'account.self_exclusion_started',ip);
+    return send(res,200,{ message:'Self-exclusion started. This cannot be undone before it ends.', selfExcludedUntil:until.toISOString(), requestId });
+  }
+
   if (req.method==='POST' && url.pathname==='/api/v1/auth/logout') { await pool.query('UPDATE auth_sessions SET revoked_at=now() WHERE id=$1',[user.id]);audit(user.user_id,'auth.logout',ip);return send(res,204,''); }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/enroll') { const secret=auth.randomBase32(); await pool.query('UPDATE users SET mfa_pending_secret_encrypted=$1 WHERE id=$2',[auth.encrypt(secret),user.user_id]);return send(res,200,{secret,otpauthUrl:`otpauth://totp/WINZA:${encodeURIComponent(user.email)}?secret=${secret}&issuer=WINZA&algorithm=SHA1&digits=6&period=30`,requestId}); }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/confirm') { const {rows}=await pool.query('SELECT mfa_pending_secret_encrypted FROM users WHERE id=$1',[user.user_id]);if(!rows[0]?.mfa_pending_secret_encrypted||!auth.validTotp(auth.decrypt(rows[0].mfa_pending_secret_encrypted),data.code))return fail(res,400,'Invalid authenticator code.',requestId);await pool.query('UPDATE users SET mfa_secret_encrypted=mfa_pending_secret_encrypted,mfa_pending_secret_encrypted=NULL,mfa_enabled_at=now() WHERE id=$1',[user.user_id]);audit(user.user_id,'auth.mfa_enabled',ip);return send(res,200,{message:'MFA enabled.',requestId}); }
@@ -386,7 +500,7 @@ const server = http.createServer(async (req,res) => {
     if(req.method==='GET'&&url.pathname==='/api/v1/public/config'){const rtp=await getGameRtp();return send(res,200,{mode:MODE,realMoneyEnabled:false,rtp,rtpMin:rtpConfig.RTP_MIN,rtpMax:rtpConfig.RTP_MAX,message:'Payments and real-money play are disabled until licensed production services are configured.',requestId});}
     if(req.method==='GET'&&url.pathname==='/rtp-config.js')return fs.readFile(path.join(root,'rtp-config.js'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'application/javascript; charset=utf-8'));
     if(url.pathname.startsWith('/api/v1/admin/'))return await handleAdmin(req,res,url,requestId,ip);
-    if(url.pathname.startsWith('/api/v1/auth/')||url.pathname.startsWith('/api/v1/wallet/')||url.pathname.startsWith('/api/v1/kyc/'))return await handleAuth(req,res,url,requestId,ip);
+    if(url.pathname.startsWith('/api/v1/auth/')||url.pathname.startsWith('/api/v1/wallet/')||url.pathname.startsWith('/api/v1/kyc/')||url.pathname.startsWith('/api/v1/account/'))return await handleAuth(req,res,url,requestId,ip);
     if(req.method==='GET'&&(url.pathname==='/'||url.pathname==='/winza.html'))return fs.readFile(path.join(root,'winza.html'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));
     if(req.method==='GET'&&(url.pathname==='/admin'||url.pathname==='/admin.html'))return fs.readFile(path.join(root,'admin.html'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));
     return fail(res,404,'Not found',requestId);

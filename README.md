@@ -107,6 +107,33 @@ identity match, by design. A player with no KYC on file has nothing for staff
 to verify the request against, which is itself a reason to require KYC before
 real-money launch (see below).
 
+## Responsible gambling
+
+Stake limits, cool-off, and self-exclusion are server-enforced, not just
+client-side UI state — clearing browser storage or switching devices no
+longer undoes them.
+
+- `GET /api/v1/account/limits` — current stake limit (and any pending
+  change), cool-off, and self-exclusion status.
+- `PUT /api/v1/account/limits/stake` — `{ dailyStakeLimit }` (or `null` to
+  remove it). Tightening a limit, or setting one for the first time, applies
+  immediately. Loosening or removing one is deferred 24 hours — long enough
+  that it can't be undone in the same moment of impulse that prompted it.
+- `POST /api/v1/account/limits/cool-off` — `{ hours }`, 24-720. Can be
+  extended but never shortened once active.
+- `POST /api/v1/account/limits/self-exclude` — 180 days, cannot be reversed
+  early through this app at all.
+
+Starting a cool-off or self-exclusion immediately revokes every active
+session on the account. While either is in effect, `POST
+/api/v1/auth/otp/verify` refuses to issue a new session (with a message
+naming which restriction and until when), and `POST
+/api/v1/wallet/withdrawal-requests` checks it again as defense-in-depth for
+a session that was already issued in the hours just before a restriction
+started. There's currently no server-mediated wagering endpoint — gameplay
+itself is still a client-side simulation (see the top of this file) — so
+login and withdrawals are the two points that actually matter today.
+
 ## Admin panel
 
 `/admin.html` (also served at `/admin`) is a separate, staff-only page with two
