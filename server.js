@@ -7,6 +7,7 @@ const auth = require('./auth');
 const wallet = require('./wallet');
 const otpLib = require('./otp');
 const rtpConfig = require('./rtp-config');
+const sanctions = require('./sanctions');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -50,7 +51,7 @@ function ready(res, requestId) { if (!pool || !JWT_SECRET || JWT_SECRET.length <
 async function sessionFrom(req) { const token=(req.headers.authorization||'').replace(/^Bearer\s+/i,''); const payload=auth.verify(token,JWT_SECRET); const { rows }=await pool.query('SELECT s.id,u.id AS user_id,u.email,u.phone_number,u.display_name,u.role,u.is_active,u.kyc_status FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND s.expires_at>now() AND s.revoked_at IS NULL',[payload.sid]); if(!rows[0]||!rows[0].is_active)throw new Error('Unauthorized'); return rows[0]; }
 function issueSession(user) { const sid=crypto.randomUUID(), expires=new Date(Date.now()+8*60*60_000); return pool.query('INSERT INTO auth_sessions (id,user_id,expires_at) VALUES ($1,$2,$3)',[sid,user.id,expires]).then(()=>({accessToken:auth.sign({sub:user.id,sid,role:user.role},JWT_SECRET,8*60*60),expiresAt:expires.toISOString()})); }
 function safeUser(row) { return { id:row.id||row.user_id,email:row.email,phoneNumber:row.phone_number,displayName:row.display_name,role:row.role,mfaEnabled:Boolean(row.mfa_enabled_at),kycStatus:row.kyc_status }; }
-function safeSubmission(row) { return { id:row.id,status:row.status,idType:row.id_type,submittedAt:row.created_at,reviewedAt:row.reviewed_at,rejectionReason:row.rejection_reason }; }
+function safeSubmission(row) { return { id:row.id,status:row.status,idType:row.id_type,submittedAt:row.created_at,reviewedAt:row.reviewed_at,rejectionReason:row.rejection_reason,sanctionsScreeningStatus:row.sanctions_screening_status,sanctionsScreeningDetail:row.sanctions_screening_detail }; }
 async function getSetting(key, fallback) { const { rows }=await pool.query('SELECT value FROM platform_settings WHERE key=$1',[key]); return rows[0] ? rows[0].value : fallback; }
 // The authoritative RTP for a future real-money launch. Validated on the way
 // out, not just on the way in: a database row can only be written within
@@ -408,8 +409,50 @@ async function handleAdmin(req,res,url,requestId,ip) {
     return send(res,200,{ rtp, requestId });
   }
 
-  if (approveMatch || rejectMatch) {
-    const submissionId=(approveMatch||rejectMatch)[1];
+  if (approveMatch) {
+    const submissionId=approveMatch[1];
+    const data=await body(req);
+    // Screen before opening a transaction — an external HTTP call (a real
+    // screening provider) should never happen while holding a FOR UPDATE
+    // row lock. Re-checked for status='pending' again inside the
+    // transaction below to close the race against a second reviewer.
+    const { rows:lookup }=await pool.query(`SELECT * FROM kyc_submissions WHERE id=$1 AND status='pending'`,[submissionId]);
+    const pendingSubmission=lookup[0];
+    if (!pendingSubmission) return fail(res,404,'No pending submission with that id.',requestId);
+
+    let screeningStatus, screeningDetail;
+    try {
+      const result=await sanctions.screen({ fullName:pendingSubmission.full_name, dateOfBirth:pendingSubmission.date_of_birth, idType:pendingSubmission.id_type, idNumber:pendingSubmission.id_number });
+      if (!result.configured) {
+        // Fail safe, not fail open: no provider configured does NOT mean
+        // "treat as clear" — it means a human has to explicitly say so, and
+        // that reason is logged and stored on the submission permanently.
+        const override=String(data.sanctionsScreeningOverrideReason||'').trim();
+        if (override.length<10) return fail(res,400,'No sanctions-screening provider is configured. Approving requires sanctionsScreeningOverrideReason (10+ characters) explicitly acknowledging this was not automatically screened.',requestId);
+        screeningStatus='not_configured_override'; screeningDetail=override.slice(0,500);
+      } else if (result.hit) {
+        audit(user.user_id,'kyc.sanctions_hit_blocked_approval',ip,{submissionId,detail:result.detail});
+        return fail(res,409,'This submission matched a sanctions/PEP screening result and cannot be approved this way. Reject it or escalate for manual review.',requestId);
+      } else {
+        screeningStatus='clear'; screeningDetail=result.detail||null;
+      }
+    } catch(e) { return fail(res,502,'Sanctions screening provider request failed — try again.',requestId); }
+
+    const client=await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows }=await client.query(`SELECT * FROM kyc_submissions WHERE id=$1 AND status='pending' FOR UPDATE`,[submissionId]);
+      const submission=rows[0];
+      if (!submission) { await client.query('ROLLBACK'); return fail(res,404,'No pending submission with that id.',requestId); }
+      await client.query(`UPDATE kyc_submissions SET status='verified', reviewed_by=$1, reviewed_at=now(), sanctions_screening_status=$2, sanctions_screening_detail=$3, sanctions_screened_at=now() WHERE id=$4`,[user.user_id,screeningStatus,screeningDetail,submissionId]);
+      await client.query(`UPDATE users SET kyc_status='verified', kyc_reviewed_by=$1, kyc_reviewed_at=now(), updated_at=now() WHERE id=$2`,[user.user_id,submission.user_id]);
+      await client.query('COMMIT');
+    } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    audit(user.user_id,'kyc.approved',ip,{submissionId,screeningStatus});
+    return send(res,200,{ message:'Approved.', requestId });
+  }
+  if (rejectMatch) {
+    const submissionId=rejectMatch[1];
     const data=await body(req);
     const client=await pool.connect();
     try {
@@ -417,18 +460,13 @@ async function handleAdmin(req,res,url,requestId,ip) {
       const { rows }=await client.query(`SELECT * FROM kyc_submissions WHERE id=$1 AND status='pending' FOR UPDATE`,[submissionId]);
       const submission=rows[0];
       if (!submission) { await client.query('ROLLBACK'); return fail(res,404,'No pending submission with that id.',requestId); }
-      if (approveMatch) {
-        await client.query(`UPDATE kyc_submissions SET status='verified', reviewed_by=$1, reviewed_at=now() WHERE id=$2`,[user.user_id,submissionId]);
-        await client.query(`UPDATE users SET kyc_status='verified', kyc_reviewed_by=$1, kyc_reviewed_at=now(), updated_at=now() WHERE id=$2`,[user.user_id,submission.user_id]);
-      } else {
-        const reason=String(data.reason||'').trim().slice(0,300)||'Not specified';
-        await client.query(`UPDATE kyc_submissions SET status='rejected', reviewed_by=$1, reviewed_at=now(), rejection_reason=$2 WHERE id=$3`,[user.user_id,reason,submissionId]);
-        await client.query(`UPDATE users SET kyc_status='rejected', kyc_reviewed_by=$1, kyc_reviewed_at=now(), updated_at=now() WHERE id=$2`,[user.user_id,submission.user_id]);
-      }
+      const reason=String(data.reason||'').trim().slice(0,300)||'Not specified';
+      await client.query(`UPDATE kyc_submissions SET status='rejected', reviewed_by=$1, reviewed_at=now(), rejection_reason=$2 WHERE id=$3`,[user.user_id,reason,submissionId]);
+      await client.query(`UPDATE users SET kyc_status='rejected', kyc_reviewed_by=$1, kyc_reviewed_at=now(), updated_at=now() WHERE id=$2`,[user.user_id,submission.user_id]);
       await client.query('COMMIT');
     } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
-    audit(user.user_id, approveMatch?'kyc.approved':'kyc.rejected', ip, { submissionId });
-    return send(res,200,{ message: approveMatch?'Approved.':'Rejected.', requestId });
+    audit(user.user_id,'kyc.rejected',ip,{submissionId});
+    return send(res,200,{ message:'Rejected.', requestId });
   }
 
   if (req.method==='GET' && url.pathname==='/api/v1/admin/phone-recovery-requests') {

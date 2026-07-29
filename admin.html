@@ -267,6 +267,13 @@
       } else {
         actionsCell = '<span class="muted">Reviewed ' + new Date(s.reviewedAt).toLocaleString() + '</span>';
       }
+      const screeningCell = s.status === 'verified'
+        ? (s.sanctionsScreeningStatus === 'clear'
+            ? '<span class="kyc-match">Clear</span>'
+            : s.sanctionsScreeningStatus === 'not_configured_override'
+              ? `<span class="kyc-mismatch">Unscreened — override</span><div class="muted">${esc(s.sanctionsScreeningDetail || '')}</div>`
+              : '<span class="muted">—</span>')
+        : '<span class="muted">—</span>';
       return `
         <tr>
           <td>${esc(s.fullName)}<div class="muted">${esc(s.displayName)}</div></td>
@@ -275,12 +282,13 @@
           <td>${esc(s.idType.toUpperCase())}<div class="muted">${esc(s.idNumber)}</div></td>
           <td>${esc(submitted)}</td>
           <td>${badge}</td>
+          <td>${screeningCell}</td>
           <td>${actionsCell}</td>
         </tr>`;
     }).join('');
     container.innerHTML = `
       <table>
-        <thead><tr><th>Name</th><th>Phone</th><th>DOB</th><th>ID</th><th>Submitted</th><th>Status</th><th>Action</th></tr></thead>
+        <thead><tr><th>Name</th><th>Phone</th><th>DOB</th><th>ID</th><th>Submitted</th><th>Status</th><th>Screening</th><th>Action</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
   }
@@ -349,7 +357,22 @@
       await api(`/api/v1/admin/kyc/submissions/${id}/approve`, { method: 'POST', body: '{}' });
       toast('Approved.');
       loadQueue();
-    } catch (e) { toast(e.message); }
+    } catch (e) {
+      // No sanctions-screening provider configured on this deployment — the
+      // server refuses to silently treat that as clear and asks for an
+      // explicit, logged reason instead. See sanctions.js / README.
+      if (/sanctionsScreeningOverrideReason/i.test(e.message)) {
+        const reason = prompt('No sanctions-screening provider is configured. Enter a reason to approve anyway (recorded in the audit log and on the submission):');
+        if (!reason || reason.trim().length < 10) { toast('Approval cancelled — reason must be at least 10 characters.'); return; }
+        try {
+          await api(`/api/v1/admin/kyc/submissions/${id}/approve`, { method: 'POST', body: JSON.stringify({ sanctionsScreeningOverrideReason: reason.trim() }) });
+          toast('Approved (unscreened — override recorded).');
+          loadQueue();
+        } catch (e2) { toast(e2.message); }
+        return;
+      }
+      toast(e.message);
+    }
   }
 
   async function reject(id) {

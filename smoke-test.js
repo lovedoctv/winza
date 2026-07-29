@@ -174,8 +174,22 @@ async function main() {
       const submission = (data.submissions || []).find(s => s.phoneNumber?.endsWith(suffix));
       record('admin sees the pending submission', Boolean(submission));
       if (submission) {
+        // No SANCTIONS_SCREENING_WEBHOOK_URL is assumed configured on a
+        // typical test/staging server, so approving with no override reason
+        // should be refused — the fail-safe (not fail-open) behavior is
+        // exactly what's under test here, not a provider integration.
         res = await fetch(`${BASE_URL}/api/v1/admin/kyc/submissions/${submission.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` }, body: '{}' });
-        record('admin approves the submission', res.ok);
+        data = await json(res);
+        const noProviderConfigured = res.status === 400 && /sanctionsScreeningOverrideReason/i.test(data.error || '');
+        if (noProviderConfigured) {
+          record('approval without screening requires an override reason (400)', true);
+          res = await fetch(`${BASE_URL}/api/v1/admin/kyc/submissions/${submission.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` }, body: JSON.stringify({ sanctionsScreeningOverrideReason: 'Smoke test — no provider configured on this deployment.' }) });
+          record('admin approves the submission with an override reason', res.ok, JSON.stringify(await json(res)));
+        } else {
+          // A real screening provider is configured on this deployment — the
+          // first call above should have succeeded outright (assuming a clear result).
+          record('admin approves the submission', res.ok, JSON.stringify(data));
+        }
 
         res = await fetch(`${BASE_URL}/api/v1/kyc/me`, { headers: { Authorization: `Bearer ${token}` } });
         data = await json(res);

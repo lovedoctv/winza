@@ -74,6 +74,19 @@ This collects identity fields as text only — no document photo upload yet. Add
 that would mean wiring up object storage (an S3-compatible bucket or similar),
 which isn't part of this pass.
 
+**Sanctions/PEP screening runs on approval, not submission.** See
+`sanctions.js` and `SANCTIONS_SCREENING_WEBHOOK_URL` in `.env.example`. When a
+staff member approves a submission:
+- No provider configured (the default): approval requires an explicit
+  `sanctionsScreeningOverrideReason` (10+ characters) in the request —
+  `/admin.html` prompts for this automatically and records it on the
+  submission (`sanctions_screening_status = 'not_configured_override'`).
+  Unscreened approvals are never silent.
+- Provider configured and clear: approval proceeds,
+  `sanctions_screening_status = 'clear'`.
+- Provider configured and a hit: approval is refused outright (409) — the
+  submission has to be rejected or escalated for manual review instead.
+
 ## Account recovery (lost phone number)
 
 Players authenticate with phone + OTP only — there's no password, so there's

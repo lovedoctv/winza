@@ -110,6 +110,13 @@ CREATE TABLE kyc_submissions (
   reviewed_by UUID REFERENCES users(id),
   reviewed_at TIMESTAMPTZ,
   rejection_reason TEXT,
+  -- Set on approval by server.js's sanctions-screening step (sanctions.js).
+  -- 'not_configured_override' means no screening provider was configured and
+  -- a staff member explicitly acknowledged that instead of it being silently
+  -- treated as clear — see sanctions_screening_detail for their reason.
+  sanctions_screening_status TEXT CHECK (sanctions_screening_status IN ('clear','hit','not_configured_override')),
+  sanctions_screening_detail TEXT,
+  sanctions_screened_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX kyc_submissions_user_idx ON kyc_submissions(user_id, created_at DESC);
