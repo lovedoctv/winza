@@ -123,3 +123,31 @@ CREATE TABLE platform_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 INSERT INTO platform_settings (key, value) VALUES ('kyc_required_for_withdrawal', 'true'::jsonb);
+
+-- Defense-in-depth for the RTP (Return to Player) floor introduced ahead of
+-- a future real-money launch: the server already validates 0.90-1.00 before
+-- writing game_rtp (see server.js), but this trigger rejects an
+-- out-of-bounds value even on a direct SQL write that skips the API entirely.
+CREATE OR REPLACE FUNCTION enforce_game_rtp_bounds() RETURNS trigger AS $$
+DECLARE
+  rtp_value NUMERIC;
+BEGIN
+  IF NEW.key = 'game_rtp' THEN
+    IF jsonb_typeof(NEW.value) <> 'number' THEN
+      RAISE EXCEPTION 'game_rtp must be a JSON number';
+    END IF;
+    rtp_value := (NEW.value)::text::numeric;
+    IF rtp_value < 0.90 OR rtp_value > 1.00 THEN
+      RAISE EXCEPTION 'game_rtp must be between 0.90 and 1.00, got %', rtp_value;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER platform_settings_rtp_bounds
+  BEFORE INSERT OR UPDATE ON platform_settings
+  FOR EACH ROW EXECUTE FUNCTION enforce_game_rtp_bounds();
+
+-- Default RTP: 96%, within the 90-100% floor/ceiling above.
+INSERT INTO platform_settings (key, value) VALUES ('game_rtp', '0.96'::jsonb);

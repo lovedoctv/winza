@@ -6,6 +6,7 @@ const { Pool } = require('pg');
 const auth = require('./auth');
 const wallet = require('./wallet');
 const otpLib = require('./otp');
+const rtpConfig = require('./rtp-config');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -44,6 +45,19 @@ function issueSession(user) { const sid=crypto.randomUUID(), expires=new Date(Da
 function safeUser(row) { return { id:row.id||row.user_id,email:row.email,phoneNumber:row.phone_number,displayName:row.display_name,role:row.role,mfaEnabled:Boolean(row.mfa_enabled_at),kycStatus:row.kyc_status }; }
 function safeSubmission(row) { return { id:row.id,status:row.status,idType:row.id_type,submittedAt:row.created_at,reviewedAt:row.reviewed_at,rejectionReason:row.rejection_reason }; }
 async function getSetting(key, fallback) { const { rows }=await pool.query('SELECT value FROM platform_settings WHERE key=$1',[key]); return rows[0] ? rows[0].value : fallback; }
+// The authoritative RTP for a future real-money launch. Validated on the way
+// out, not just on the way in: a database row can only be written within
+// bounds (see the /api/v1/admin/game-config handler and the
+// enforce_game_rtp_bounds trigger in schema.sql), but this still guards
+// against a missing pool (sandbox mode, no database configured) or a stored
+// value that predates the 90-100% floor — either way, callers always get a
+// valid RTP back, falling back to the centralized default.
+async function getGameRtp() {
+  if (!pool) return rtpConfig.RTP_DEFAULT;
+  const raw = await getSetting('game_rtp', rtpConfig.RTP_DEFAULT);
+  const value = Number(raw);
+  return rtpConfig.isValidRtp(value) ? value : rtpConfig.RTP_DEFAULT;
+}
 function ageFromDob(dobStr) { const dob=new Date(dobStr+'T00:00:00Z'); if(Number.isNaN(dob.getTime()))return 0; const now=new Date(); let age=now.getUTCFullYear()-dob.getUTCFullYear(); const m=now.getUTCMonth()-dob.getUTCMonth(); if(m<0||(m===0&&now.getUTCDate()<dob.getUTCDate()))age--; return age; }
 
 async function handleAuth(req,res,url,requestId,ip) {
@@ -206,6 +220,32 @@ async function handleAdmin(req,res,url,requestId,ip) {
 
   const approveMatch = req.method==='POST' && url.pathname.match(/^\/api\/v1\/admin\/kyc\/submissions\/([0-9a-f-]{36})\/approve$/);
   const rejectMatch  = req.method==='POST' && url.pathname.match(/^\/api\/v1\/admin\/kyc\/submissions\/([0-9a-f-]{36})\/reject$/);
+  // Read-only RTP lookup — any staff role (support/risk/admin/owner, gated
+  // above) can see the current configured RTP and its bounds.
+  if (req.method==='GET' && url.pathname==='/api/v1/admin/game-config') {
+    return send(res,200,{ rtp:await getGameRtp(), rtpMin:rtpConfig.RTP_MIN, rtpMax:rtpConfig.RTP_MAX, requestId });
+  }
+
+  // Changing the RTP is a financial-risk control, not a KYC action — restrict
+  // it beyond the support/risk/admin/owner gate above to admin/owner only.
+  if (req.method==='PUT' && url.pathname==='/api/v1/admin/game-config') {
+    if (!['admin','owner'].includes(user.role)) return fail(res,403,'Forbidden.',requestId);
+    const data=await body(req);
+    const rtpPercent=Number(data.rtpPercent);
+    const rtp=rtpPercent/100;
+    // Server-side validation: reject anything outside 90-100% regardless of
+    // what the admin UI's slider already enforced client-side — the UI is
+    // never trusted as the only line of defense. The database trigger
+    // (enforce_game_rtp_bounds in schema.sql) enforces the same bounds again
+    // on the write itself, so even a direct SQL statement can't bypass this.
+    if (!Number.isFinite(rtpPercent) || !rtpConfig.isValidRtp(rtp)) {
+      return fail(res,400,`RTP must be between ${rtpConfig.RTP_MIN*100}% and ${rtpConfig.RTP_MAX*100}%.`,requestId);
+    }
+    await pool.query('INSERT INTO platform_settings (key,value,updated_at) VALUES ($1,$2,now()) ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=now()',['game_rtp', JSON.stringify(rtp)]);
+    audit(user.user_id,'admin.rtp_updated',ip,{ rtp });
+    return send(res,200,{ rtp, requestId });
+  }
+
   if (approveMatch || rejectMatch) {
     const submissionId=(approveMatch||rejectMatch)[1];
     const data=await body(req);
@@ -237,7 +277,8 @@ const server = http.createServer(async (req,res) => {
   res.setHeader('X-Request-Id',requestId);
   try {
     if(req.method==='GET'&&url.pathname==='/healthz')return send(res,200,{ok:true,mode:MODE,databaseConfigured:Boolean(pool),requestId});
-    if(req.method==='GET'&&url.pathname==='/api/v1/public/config')return send(res,200,{mode:MODE,realMoneyEnabled:false,message:'Payments and real-money play are disabled until licensed production services are configured.',requestId});
+    if(req.method==='GET'&&url.pathname==='/api/v1/public/config'){const rtp=await getGameRtp();return send(res,200,{mode:MODE,realMoneyEnabled:false,rtp,rtpMin:rtpConfig.RTP_MIN,rtpMax:rtpConfig.RTP_MAX,message:'Payments and real-money play are disabled until licensed production services are configured.',requestId});}
+    if(req.method==='GET'&&url.pathname==='/rtp-config.js')return fs.readFile(path.join(root,'rtp-config.js'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'application/javascript; charset=utf-8'));
     if(url.pathname.startsWith('/api/v1/admin/'))return await handleAdmin(req,res,url,requestId,ip);
     if(url.pathname.startsWith('/api/v1/auth/')||url.pathname.startsWith('/api/v1/wallet/')||url.pathname.startsWith('/api/v1/kyc/'))return await handleAuth(req,res,url,requestId,ip);
     if(req.method==='GET'&&(url.pathname==='/'||url.pathname==='/winza.html'))return fs.readFile(path.join(root,'winza.html'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));

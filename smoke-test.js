@@ -39,10 +39,12 @@ async function main() {
     return finish();
   }
 
-  // 2. Public config still reports real money as disabled.
+  // 2. Public config still reports real money as disabled, and RTP is
+  // within the 90-100% floor/ceiling.
   res = await fetch(`${BASE_URL}/api/v1/public/config`);
   data = await json(res);
   record('GET /api/v1/public/config', res.ok && data.realMoneyEnabled === false, JSON.stringify(data));
+  record('public RTP is within 90-100%', typeof data.rtp === 'number' && data.rtp >= 0.90 && data.rtp <= 1.00, `rtp=${data.rtp}`);
 
   // 3. Request an OTP for a fresh phone number.
   const { raw: phone, suffix } = randomPhone();
@@ -135,6 +137,20 @@ async function main() {
         data = await json(res);
         record('player now shows verified', res.ok && data.kycStatus === 'verified', JSON.stringify(data));
       }
+
+      // RTP admin endpoint: an out-of-bounds value is rejected, a valid one is accepted.
+      res = await fetch(`${BASE_URL}/api/v1/admin/game-config`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` },
+        body: JSON.stringify({ rtpPercent: 50 }),
+      });
+      record('RTP below 90% rejected (400)', res.status === 400);
+
+      res = await fetch(`${BASE_URL}/api/v1/admin/game-config`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` },
+        body: JSON.stringify({ rtpPercent: 96 }),
+      });
+      data = await json(res);
+      record('RTP set to 96% accepted', res.ok && data.rtp === 0.96, JSON.stringify(data));
     }
   } else {
     console.log('(skipping admin-approval checks — set STAFF_EMAIL/STAFF_PASSWORD to include them)');

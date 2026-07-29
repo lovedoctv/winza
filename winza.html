@@ -367,6 +367,8 @@
     <div class="legal-body">
       <h4>Operating status</h4>
       <p>WINZA is running in <b style="color:var(--chalk)">sandbox/demo mode</b>. No real-money wagers are accepted and no gambling licence has been issued yet. Balances shown across the app are simulated tokens with no cash value.</p>
+      <h4>Return to Player</h4>
+      <p id="legalRtpValue">Return to Player (RTP): 96%</p>
       <h4>Before real-money launch</h4>
       <ul>
         <li>A gambling licence for each operating jurisdiction, with age verification (18+) enforced at signup.</li>
@@ -434,8 +436,8 @@
   <div class="admin-section">
     <h3>🎛️ Game Configuration</h3>
     <div class="admin-config-row">
-      <div class="admin-config-label"><span>Target RTP</span><strong id="adminRtpLabel">80%</strong></div>
-      <input type="range" id="adminRtpSlider" min="50" max="95" step="1" value="80">
+      <div class="admin-config-label"><span>Target RTP</span><strong id="adminRtpLabel">96%</strong></div>
+      <input type="range" id="adminRtpSlider" min="90" max="100" step="1" value="96">
     </div>
     <div class="admin-config-row">
       <div class="admin-config-label"><span>Minimum stake</span><strong id="adminMinLabel">₦100</strong></div>
@@ -699,10 +701,16 @@
   <button class="nav-btn" data-tab="settings" onclick="switchTab('settings')"><span class="icon">⚙️</span><span>Settings</span></button>
 </div>
 
+<script src="/rtp-config.js"></script>
 <script>
 (function () {
   const MIN_CHANCE = 0.03;
   const MAX_CHANCE = 0.9;
+  // Loaded from /rtp-config.js — the same module the server uses, so the
+  // client can never accept an RTP outside what the backend would also
+  // accept (see server.js's rtpConfig usage and its enforce_game_rtp_bounds
+  // trigger in schema.sql).
+  const { RTP_MIN, RTP_MAX, RTP_DEFAULT, sanitizeRtp } = window.WINZA_RTP_CONFIG;
   const STORAGE_KEY = 'winza-v1';
   const START_BALANCE = 50000;
   const SLICES = 24;
@@ -754,7 +762,7 @@
     referralCode: '', referralCount: 0, referralEarnings: 0,
     playerName: 'Player One', playerId: '', jackpot: 5000000,
     soundEnabled: true, hapticEnabled: true, reducedMotion: false,
-    config: { rtp: 0.8, minStake: 100, maxStake: 50000, jackpotPct: 0.05 },
+    config: { rtp: RTP_DEFAULT, minStake: 100, maxStake: 50000, jackpotPct: 0.05 },
     rg: { stakeLimit: null, coolOffUntil: null, selfExcludedUntil: null }
   };
 
@@ -830,6 +838,7 @@
     privacyOpenBtn: document.getElementById('privacyOpenBtn'),
     rgModal: document.getElementById('rgModal'),
     legalModal: document.getElementById('legalModal'),
+    legalRtpValue: document.getElementById('legalRtpValue'),
     privacyModal: document.getElementById('privacyModal'),
     rgStatusBox: document.getElementById('rgStatusBox'),
     rgStakeLimitInput: document.getElementById('rgStakeLimitInput'),
@@ -954,7 +963,11 @@
   function currentStake() { return Number(el.stakeSlider.value); }
   function currentMultiplier() { return Number(el.multSlider.value); }
   function computePayout(stake, mult) { return Math.round((stake * mult) / 100) * 100; }
-  function computeChance(mult) { return clamp(state.config.rtp / mult, MIN_CHANCE, MAX_CHANCE); }
+  // RTP is validated on every read here, not just when it's assigned — this
+  // is what actually prevents an out-of-range or corrupted RTP (a tampered
+  // save, a bypassed slider) from ever reaching the game's odds math,
+  // regardless of how state.config.rtp got that way.
+  function computeChance(mult) { return clamp(sanitizeRtp(state.config.rtp) / mult, MIN_CHANCE, MAX_CHANCE); }
   function randomCode() {
     const chars = '0123456789ABCDEFGHJKMNPQRSTUVWXYZ';
     let c = '';
@@ -1196,6 +1209,14 @@
     renderProfile();
     renderLeaderboard();
     updateRiskPanel();
+    renderLegalRtp();
+  }
+
+  // Player-facing RTP disclosure shown in the Licence & Legal (game
+  // information) panel — always derived from the sanitized value so it can
+  // never display a percentage below 90% or above 100%.
+  function renderLegalRtp() {
+    el.legalRtpValue.textContent = `Return to Player (RTP): ${Math.round(sanitizeRtp(state.config.rtp) * 100)}%`;
   }
 
   function renderHistory() {
@@ -1507,7 +1528,7 @@
       referralCode: generateReferral(), referralCount: 0, referralEarnings: 0,
       playerName: 'Player One', playerId: randomCode(), jackpot: 5000000,
       soundEnabled: true, hapticEnabled: true, reducedMotion: false,
-      config: { rtp: 0.8, minStake: 100, maxStake: 50000, jackpotPct: 0.05 },
+      config: { rtp: RTP_DEFAULT, minStake: 100, maxStake: 50000, jackpotPct: 0.05 },
       rg: { stakeLimit: null, coolOffUntil: null, selfExcludedUntil: null },
       enhance: {}
     };
@@ -1724,7 +1745,11 @@
   }
 
   function populateAdminConfig() {
-    el.adminRtpSlider.value = Math.round(state.config.rtp * 100);
+    // Bounds come from the centralized config, not just the HTML attributes,
+    // so the enforced range can't drift out of sync with the server's.
+    el.adminRtpSlider.min = Math.round(RTP_MIN * 100);
+    el.adminRtpSlider.max = Math.round(RTP_MAX * 100);
+    el.adminRtpSlider.value = Math.round(sanitizeRtp(state.config.rtp) * 100);
     el.adminMinSlider.value = state.config.minStake;
     el.adminMaxSlider.value = state.config.maxStake;
     el.adminJackpotSlider.value = Math.round(state.config.jackpotPct * 100);
@@ -1746,7 +1771,9 @@
       showToast('Min stake must be below max stake');
       return;
     }
-    state.config.rtp = Number(el.adminRtpSlider.value) / 100;
+    // Sanitized here too, defensively, in case the slider's min/max attributes
+    // were bypassed (e.g. via devtools) rather than left at their enforced 90-100 range.
+    state.config.rtp = sanitizeRtp(Number(el.adminRtpSlider.value) / 100);
     state.config.minStake = Number(el.adminMinSlider.value);
     state.config.maxStake = Number(el.adminMaxSlider.value);
     state.config.jackpotPct = Number(el.adminJackpotSlider.value) / 100;
@@ -1996,9 +2023,13 @@
       }
     } catch (e) {}
     // Enforce hard stake limits so older saved data can't keep an outdated minimum/maximum
-    state.config = Object.assign({ rtp: 0.8, minStake: 100, maxStake: 50000, jackpotPct: 0.05 }, state.config || {});
+    state.config = Object.assign({ rtp: RTP_DEFAULT, minStake: 100, maxStake: 50000, jackpotPct: 0.05 }, state.config || {});
     state.config.minStake = 100;
     state.config.maxStake = 50000;
+    // Loaded from local storage — could be an old save from before the
+    // 90-100% floor existed, or tampered data. Validate before use and fall
+    // back to the centralized default rather than let an invalid RTP through.
+    state.config.rtp = sanitizeRtp(state.config.rtp);
     state.rg = Object.assign({ stakeLimit: null, coolOffUntil: null, selfExcludedUntil: null }, state.rg || {});
     if (!state.playerId) state.playerId = randomCode();
     if (!state.referralCode) state.referralCode = generateReferral();
