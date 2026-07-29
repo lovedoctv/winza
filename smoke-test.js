@@ -70,6 +70,7 @@ async function main() {
   });
   data = await json(res);
   const token = data.accessToken;
+  const originalUserId = data.user?.id;
   record('POST /api/v1/auth/otp/verify', res.ok && Boolean(token) && data.isNewAccount === true, token ? 'token received, new account' : JSON.stringify(data));
   if (!token) return finish();
 
@@ -165,6 +166,51 @@ async function main() {
 
   res = await fetch(`${BASE_URL}/api/v1/auth/me`, { headers: { Authorization: `Bearer ${token}` } });
   record('token rejected after logout', res.status === 401);
+
+  // 13. Optional: phone recovery flow end-to-end (needs staff credentials,
+  // same as step 11). Run last since approval revokes the account's sessions
+  // and changes which phone number logs into it — reusing `token` afterward
+  // would no longer prove anything.
+  if (process.env.STAFF_EMAIL && process.env.STAFF_PASSWORD) {
+    res = await fetch(`${BASE_URL}/api/v1/auth/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: process.env.STAFF_EMAIL, password: process.env.STAFF_PASSWORD }),
+    });
+    data = await json(res);
+    const staffToken = data.accessToken;
+    if (staffToken) {
+      const { raw: newPhoneRaw } = randomPhone();
+      res = await fetch(`${BASE_URL}/api/v1/auth/recovery/phone-change-request`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ oldPhone: phone, newPhone: newPhoneRaw, fullName: 'Smoke Test', dateOfBirth: '1995-01-01', idType: 'nin', idNumber: '12345678901', reason: 'Lost phone' }),
+      });
+      record('POST /api/v1/auth/recovery/phone-change-request', res.status === 202);
+
+      res = await fetch(`${BASE_URL}/api/v1/admin/phone-recovery-requests?status=pending`, { headers: { Authorization: `Bearer ${staffToken}` } });
+      data = await json(res);
+      const recoveryReq = (data.requests || []).find(r => r.oldPhoneNumber?.endsWith(suffix));
+      record('admin sees the pending phone recovery request', Boolean(recoveryReq));
+      if (recoveryReq) {
+        record('KYC-on-file comparison present', Boolean(recoveryReq.kycOnFile));
+        res = await fetch(`${BASE_URL}/api/v1/admin/phone-recovery-requests/${recoveryReq.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` }, body: '{}' });
+        record('admin approves the phone recovery request', res.ok);
+
+        // Confirm the new number now logs into the *same* account rather
+        // than registering a fresh one.
+        res = await fetch(`${BASE_URL}/api/v1/auth/otp/request`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: newPhoneRaw }) });
+        data = await json(res);
+        if (data.devCode) {
+          res = await fetch(`${BASE_URL}/api/v1/auth/otp/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: newPhoneRaw, code: data.devCode }) });
+          data = await json(res);
+          record('new number logs into the same account after approval', res.ok && data.user?.id === originalUserId && data.isNewAccount === false, JSON.stringify(data.user));
+        } else {
+          console.log('(skipping post-approval login check — needs OTP_DEV_ECHO=true on the target server)');
+        }
+      }
+    }
+  } else {
+    console.log('(skipping phone recovery checks — set STAFF_EMAIL/STAFF_PASSWORD to include them)');
+  }
 
   finish();
 }

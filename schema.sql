@@ -115,6 +115,32 @@ CREATE TABLE kyc_submissions (
 CREATE INDEX kyc_submissions_user_idx ON kyc_submissions(user_id, created_at DESC);
 CREATE INDEX kyc_submissions_status_idx ON kyc_submissions(status, created_at);
 
+-- Players authenticate with phone + OTP only (no password), so there's no
+-- "forgot password" flow — but a player who loses access to the phone number
+-- on their account (lost phone, stolen SIM, recycled number) has no way back
+-- in either, since phone_number is a hard unique identifier. This backs a
+-- staff-reviewed recovery path: the player submits identity details plus a
+-- new number, staff compares that against the KYC record on file, and
+-- approval is what actually rewrites users.phone_number (see server.js).
+CREATE TABLE phone_recovery_requests (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  old_phone_number TEXT NOT NULL,
+  new_phone_number TEXT NOT NULL,
+  full_name TEXT NOT NULL,
+  date_of_birth DATE NOT NULL,
+  id_type TEXT NOT NULL CHECK (id_type IN ('nin','bvn','drivers_license','passport','voters_card')),
+  id_number TEXT NOT NULL,
+  reason TEXT,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+  reviewed_by UUID REFERENCES users(id),
+  reviewed_at TIMESTAMPTZ,
+  rejection_reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX phone_recovery_requests_status_idx ON phone_recovery_requests(status, created_at);
+CREATE INDEX phone_recovery_requests_user_idx ON phone_recovery_requests(user_id, created_at DESC);
+
 -- Backend-controlled feature flags (e.g. "is KYC required for withdrawal"),
 -- so behavior can change without a redeploy.
 CREATE TABLE platform_settings (

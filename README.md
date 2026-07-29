@@ -11,8 +11,9 @@ Authentication requires PostgreSQL and environment secrets before it can run.
 1. Install Node.js 20 or newer.
 2. Run `npm install` to install the PostgreSQL driver.
 3. Apply `schema.sql` to a managed PostgreSQL database (fresh install). If you already
-   applied an earlier version of `schema.sql`, run `migration_002_phone_kyc.sql` instead —
-   it only adds columns/tables, safe to run against an existing database.
+   applied an earlier version of `schema.sql`, run `migration_002_phone_kyc.sql`,
+   `migration_003_rtp_config.sql`, and `migration_004_phone_recovery.sql` instead, in
+   that order — each only adds columns/tables, safe to run against an existing database.
 4. Copy `.env.example` values into your deployment secret manager and generate distinct `JWT_SECRET` and `MFA_ENCRYPTION_KEY` values.
 5. Run `npm start`.
 6. Open `http://127.0.0.1:3000`.
@@ -73,16 +74,54 @@ This collects identity fields as text only — no document photo upload yet. Add
 that would mean wiring up object storage (an S3-compatible bucket or similar),
 which isn't part of this pass.
 
+## Account recovery (lost phone number)
+
+Players authenticate with phone + OTP only — there's no password, so there's
+no "forgot password" flow. But losing access to the phone number itself (lost
+phone, stolen SIM, a recycled number) leaves a player locked out with no way
+back in, since `phone_number` is a hard unique identifier on the account. This
+is the recovery path for that case, modeled on how KYC review works: staff
+verify the requester's identity against the KYC record already on file rather
+than any automated check.
+
+- `POST /api/v1/auth/recovery/phone-change-request` — unauthenticated (the
+  whole point is the requester can't log in): `{ oldPhone, newPhone, fullName,
+  dateOfBirth, idType, idNumber, reason }`. Same identity-field validation as
+  KYC submission. Like `password-reset/request`, the response never confirms
+  whether `oldPhone` belongs to an account — it always returns a generic 202 —
+  but a request row is only created when it does.
+- Staff review it from `/admin.html`'s "Phone recovery requests" tab, or
+  directly: `GET /api/v1/admin/phone-recovery-requests?status=pending`,
+  `POST .../:id/approve`, `POST .../:id/reject` — `{ reason }`. All three
+  require `risk`, `admin`, or `owner`, same as KYC review. The admin UI shows
+  the submitted identity fields next to what's on file from the account's
+  latest verified KYC submission (if any) so a mismatch is visible at a
+  glance — a request with no verified KYC on file to compare against is
+  flagged rather than silently allowed through.
+- Approval rewrites `users.phone_number` to the new number and revokes all of
+  that account's existing sessions, so the next sign-in goes through OTP on
+  the new number rather than carrying over a stale session tied to the old one.
+
+This is a support-assisted flow, not self-service — there's no automated
+identity match, by design. A player with no KYC on file has nothing for staff
+to verify the request against, which is itself a reason to require KYC before
+real-money launch (see below).
+
 ## Admin panel
 
-`/admin.html` (also served at `/admin`) is a separate, staff-only page for
-reviewing KYC submissions — sign in with a staff email/password, filter by
-Pending/Verified/Rejected, and approve or reject with a reason. It calls:
-- `GET /api/v1/admin/kyc/submissions?status=pending`
-- `POST /api/v1/admin/kyc/submissions/:id/approve`
-- `POST /api/v1/admin/kyc/submissions/:id/reject` — `{ reason }`
+`/admin.html` (also served at `/admin`) is a separate, staff-only page with two
+queues — sign in with a staff email/password, switch between them with the
+tabs at the top:
+- **KYC submissions** — filter by Pending/Verified/Rejected, approve or reject
+  with a reason. Calls `GET /api/v1/admin/kyc/submissions?status=pending`,
+  `POST /api/v1/admin/kyc/submissions/:id/approve`, and
+  `POST /api/v1/admin/kyc/submissions/:id/reject` — `{ reason }`.
+- **Phone recovery requests** — see "Account recovery" above. Calls
+  `GET /api/v1/admin/phone-recovery-requests?status=pending`,
+  `POST /api/v1/admin/phone-recovery-requests/:id/approve`, and
+  `POST /api/v1/admin/phone-recovery-requests/:id/reject` — `{ reason }`.
 
-All three require the caller's role to be `risk`, `admin`, or `owner`.
+All of the above require the caller's role to be `risk`, `admin`, or `owner`.
 
 ## Staff accounts
 

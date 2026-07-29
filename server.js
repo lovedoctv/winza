@@ -123,6 +123,42 @@ async function handleAuth(req,res,url,requestId,ip) {
     return send(res,200,{ user:safeUser(user), isNewAccount, ...session, requestId });
   }
 
+  // Players have no password, so there's no "forgot password" flow for them —
+  // but losing access to the phone number itself (lost phone, stolen SIM, a
+  // recycled number) leaves them locked out with nothing to fall back on,
+  // since phone_number is a hard unique identifier. This is that recovery
+  // path: unauthenticated (they can't log in, that's the whole problem),
+  // staff-reviewed rather than automated, matching how KYC submissions work.
+  if (req.method==='POST' && url.pathname==='/api/v1/auth/recovery/phone-change-request') {
+    let oldPhone, newPhone;
+    try { oldPhone=otpLib.normalizePhone(data.oldPhone); newPhone=otpLib.normalizePhone(data.newPhone); }
+    catch(e) { return fail(res,400,e.message,requestId); }
+    if (oldPhone===newPhone) return fail(res,400,'New number must be different from the number on file.',requestId);
+    const fullName=String(data.fullName||'').trim(), dob=String(data.dateOfBirth||'').trim(), idType=String(data.idType||'').trim(), idNumber=String(data.idNumber||'').trim(), reason=String(data.reason||'').trim().slice(0,300);
+    if (fullName.length<2||fullName.length>80) return fail(res,400,'Enter your full legal name.',requestId);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dob)) return fail(res,400,'Enter date of birth as YYYY-MM-DD.',requestId);
+    if (ageFromDob(dob)<18) return fail(res,400,'You must be 18 or older.',requestId);
+    if (!['nin','bvn','drivers_license','passport','voters_card'].includes(idType)) return fail(res,400,'Select a valid ID type.',requestId);
+    if (idNumber.length<5||idNumber.length>30) return fail(res,400,'Enter a valid ID number.',requestId);
+    // Telling the requester their claimed new number is already taken is
+    // useful, actionable feedback and doesn't leak anything about the old
+    // (possibly lost) account — safe to answer directly.
+    const { rows:newTaken }=await pool.query('SELECT id FROM users WHERE phone_number=$1',[newPhone]);
+    if (newTaken[0]) return fail(res,409,'That new number is already registered to an account.',requestId);
+    // Same shape as password-reset/request: always return a generic 202 so
+    // the response never confirms whether the old number belongs to an
+    // account, but only actually create a request row when it does.
+    const { rows:existing }=await pool.query('SELECT id FROM users WHERE phone_number=$1 AND is_active=true',[oldPhone]);
+    if (existing[0]) {
+      const { rows:pending }=await pool.query(`SELECT id FROM phone_recovery_requests WHERE user_id=$1 AND status='pending'`,[existing[0].id]);
+      if (!pending[0]) {
+        await pool.query('INSERT INTO phone_recovery_requests (id,user_id,old_phone_number,new_phone_number,full_name,date_of_birth,id_type,id_number,reason) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',[crypto.randomUUID(),existing[0].id,oldPhone,newPhone,fullName,dob,idType,idNumber,reason||null]);
+        audit(existing[0].id,'account.phone_recovery_requested',ip,{oldPhone,newPhone});
+      }
+    }
+    return send(res,202,{ message:'If that account exists, your request has been submitted for staff review.', requestId });
+  }
+
   // Email + password registration/login below is for staff accounts
   // (support/risk/admin/owner), not players — but there's no self-serve
   // staff signup yet, so in practice accounts are provisioned with
@@ -274,6 +310,64 @@ async function handleAdmin(req,res,url,requestId,ip) {
     } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
     audit(user.user_id, approveMatch?'kyc.approved':'kyc.rejected', ip, { submissionId });
     return send(res,200,{ message: approveMatch?'Approved.':'Rejected.', requestId });
+  }
+
+  if (req.method==='GET' && url.pathname==='/api/v1/admin/phone-recovery-requests') {
+    const status=url.searchParams.get('status')||'pending';
+    if (!['pending','approved','rejected'].includes(status)) return fail(res,400,'Invalid status filter.',requestId);
+    // Join the latest verified KYC submission on file (if any) so staff can
+    // compare the identity details submitted here against what's already
+    // verified for the account, instead of trusting the request in isolation.
+    const { rows }=await pool.query(`
+      SELECT r.*, u.display_name,
+        k.full_name AS kyc_full_name, k.date_of_birth AS kyc_date_of_birth,
+        k.id_type AS kyc_id_type, k.id_number AS kyc_id_number
+      FROM phone_recovery_requests r
+      JOIN users u ON u.id=r.user_id
+      LEFT JOIN LATERAL (
+        SELECT * FROM kyc_submissions WHERE user_id=r.user_id AND status='verified' ORDER BY created_at DESC LIMIT 1
+      ) k ON true
+      WHERE r.status=$1 ORDER BY r.created_at ASC`,[status]);
+    return send(res,200,{ requests: rows.map(r=>({
+      id:r.id, userId:r.user_id, displayName:r.display_name,
+      oldPhoneNumber:r.old_phone_number, newPhoneNumber:r.new_phone_number,
+      fullName:r.full_name, dateOfBirth:r.date_of_birth, idType:r.id_type, idNumber:r.id_number,
+      reason:r.reason, status:r.status, submittedAt:r.created_at, reviewedAt:r.reviewed_at, rejectionReason:r.rejection_reason,
+      kycOnFile: r.kyc_full_name ? { fullName:r.kyc_full_name, dateOfBirth:r.kyc_date_of_birth, idType:r.kyc_id_type, idNumber:r.kyc_id_number } : null,
+    })), requestId });
+  }
+
+  const recoveryApproveMatch = req.method==='POST' && url.pathname.match(/^\/api\/v1\/admin\/phone-recovery-requests\/([0-9a-f-]{36})\/approve$/);
+  const recoveryRejectMatch  = req.method==='POST' && url.pathname.match(/^\/api\/v1\/admin\/phone-recovery-requests\/([0-9a-f-]{36})\/reject$/);
+  if (recoveryApproveMatch || recoveryRejectMatch) {
+    const reqId=(recoveryApproveMatch||recoveryRejectMatch)[1];
+    const data=await body(req);
+    const client=await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows }=await client.query(`SELECT * FROM phone_recovery_requests WHERE id=$1 AND status='pending' FOR UPDATE`,[reqId]);
+      const reqRow=rows[0];
+      if (!reqRow) { await client.query('ROLLBACK'); return fail(res,404,'No pending request with that id.',requestId); }
+      if (recoveryApproveMatch) {
+        await client.query('UPDATE users SET phone_number=$1, updated_at=now() WHERE id=$2',[reqRow.new_phone_number,reqRow.user_id]);
+        await client.query(`UPDATE phone_recovery_requests SET status='approved', reviewed_by=$1, reviewed_at=now() WHERE id=$2`,[user.user_id,reqId]);
+        // A session tied to the old identity shouldn't silently carry over a
+        // phone-number change — force a fresh OTP login on the new number.
+        await client.query('UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL',[reqRow.user_id]);
+      } else {
+        const reason=String(data.reason||'').trim().slice(0,300)||'Not specified';
+        await client.query(`UPDATE phone_recovery_requests SET status='rejected', reviewed_by=$1, reviewed_at=now(), rejection_reason=$2 WHERE id=$3`,[user.user_id,reason,reqId]);
+      }
+      await client.query('COMMIT');
+    } catch(e) {
+      await client.query('ROLLBACK');
+      // The new number could have been claimed by another account between
+      // request and review — surface that plainly rather than a 500.
+      if (e.code==='23505') return fail(res,409,'That number was registered to another account in the meantime.',requestId);
+      throw e;
+    } finally { client.release(); }
+    audit(user.user_id, recoveryApproveMatch?'phone_recovery.approved':'phone_recovery.rejected', ip, { recoveryRequestId:reqId });
+    return send(res,200,{ message: recoveryApproveMatch?'Approved. The account now signs in with the new number.':'Rejected.', requestId });
   }
 
   return fail(res,404,'Not found',requestId);
