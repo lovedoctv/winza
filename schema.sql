@@ -178,6 +178,13 @@ CREATE TABLE platform_settings (
 -- effect on a real-money deployment — see the withdrawal-requests handler.
 INSERT INTO platform_settings (key, value) VALUES ('kyc_required_for_withdrawal', 'true'::jsonb);
 
+-- Fraud/velocity caps on withdrawals: even a fully KYC-verified account
+-- shouldn't be able to drain funds in one shot. Admin/owner-adjustable via
+-- /api/v1/admin/withdrawal-limits, always bounded (see server.js) — never
+-- unlimited regardless of what an admin sets.
+INSERT INTO platform_settings (key, value) VALUES ('withdrawal_daily_amount_limit', '500000'::jsonb);
+INSERT INTO platform_settings (key, value) VALUES ('withdrawal_daily_count_limit', '5'::jsonb);
+
 -- Defense-in-depth for the RTP (Return to Player) floor introduced ahead of
 -- a future real-money launch: the server already validates 0.90-1.00 before
 -- writing game_rtp (see server.js), but this trigger rejects an

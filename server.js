@@ -108,6 +108,34 @@ function restrictionMessage(restriction) {
     ? `Self-exclusion is active until ${new Date(restriction.until).toISOString()}. This cannot be reversed early.`
     : `Cool-off is active until ${new Date(restriction.until).toISOString()}.`;
 }
+// Fraud/velocity caps on withdrawals: even a fully KYC-verified account
+// shouldn't be able to drain funds in one shot — a compromised session or an
+// abused account is exactly the case this exists for. Admin/owner-adjustable
+// (see /api/v1/admin/withdrawal-limits), bounded the same way the RTP floor
+// is: never unlimited, regardless of what an admin sets.
+async function getWithdrawalLimits() {
+  const amount = Number(await getSetting('withdrawal_daily_amount_limit', 500000));
+  const count = Number(await getSetting('withdrawal_daily_count_limit', 5));
+  return {
+    amount: Number.isFinite(amount) && amount>0 ? amount : 500000,
+    count: Number.isFinite(count) && count>0 ? count : 5,
+  };
+}
+// Sums this wallet's withdrawal-request amounts (the pending_withdrawal side
+// of the ledger entry, not the mirrored negative cash_available side) over
+// the trailing 24 hours. Reversed/rejected withdrawals still count here on
+// purpose — the cap is about how much a wallet has *requested*, not how much
+// ultimately got paid out, so an account can't probe the limit by requesting
+// and cancelling.
+async function getRecentWithdrawalActivity(walletId) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(le.amount),0)::numeric AS total, COUNT(*)::int AS count
+     FROM wallet_ledger_entries le JOIN wallet_transactions wt ON wt.id=le.transaction_id
+     WHERE wt.wallet_id=$1 AND wt.type='withdrawal_request' AND le.balance_type='pending_withdrawal' AND wt.created_at > now() - interval '24 hours'`,
+    [walletId]
+  );
+  return { total: Number(rows[0].total), count: rows[0].count };
+}
 
 async function handleAuth(req,res,url,requestId,ip) {
   if (!ready(res,requestId)) return;
@@ -279,6 +307,10 @@ async function handleAuth(req,res,url,requestId,ip) {
     const restriction=restrictionFromLimits(await getEffectiveLimits(user.user_id));
     if (restriction) return fail(res,403,restrictionMessage(restriction),requestId);
     const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId);
+    const withdrawalLimits=await getWithdrawalLimits();
+    const recentActivity=await getRecentWithdrawalActivity(row.id);
+    if (recentActivity.count+1>withdrawalLimits.count) return fail(res,429,`Daily withdrawal request limit reached (${withdrawalLimits.count} per 24 hours). Try again later or contact support.`,requestId);
+    if (recentActivity.total+amount>withdrawalLimits.amount) return fail(res,429,`Daily withdrawal amount limit reached (₦${withdrawalLimits.amount.toLocaleString()} per 24 hours). Try again later or contact support.`,requestId);
     try {
       const result=await wallet.postTransaction(pool,{ walletId:row.id, type:'withdrawal_request', idempotencyKey:data.idempotencyKey||crypto.randomUUID(), referenceType:'withdrawal', entries:[{balanceType:'cash_available',amount:-amount},{balanceType:'pending_withdrawal',amount}] });
       audit(user.user_id,'wallet.withdrawal_requested',ip,{amount});
@@ -407,6 +439,29 @@ async function handleAdmin(req,res,url,requestId,ip) {
     await pool.query('INSERT INTO platform_settings (key,value,updated_at) VALUES ($1,$2,now()) ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=now()',['game_rtp', JSON.stringify(rtp)]);
     audit(user.user_id,'admin.rtp_updated',ip,{ rtp });
     return send(res,200,{ rtp, requestId });
+  }
+
+  const WITHDRAWAL_LIMIT_BOUNDS = { minAmount:1000, maxAmount:50000000, minCount:1, maxCount:50 };
+  if (req.method==='GET' && url.pathname==='/api/v1/admin/withdrawal-limits') {
+    return send(res,200,{ limits:await getWithdrawalLimits(), bounds:WITHDRAWAL_LIMIT_BOUNDS, requestId });
+  }
+  // Same risk-control tier as RTP: admin/owner only, bounded so an
+  // over-permissive value (or an empty one) can't disable fraud protection
+  // entirely — there's always SOME daily cap, never "unlimited."
+  if (req.method==='PUT' && url.pathname==='/api/v1/admin/withdrawal-limits') {
+    if (!['admin','owner'].includes(user.role)) return fail(res,403,'Forbidden.',requestId);
+    const data=await body(req);
+    const amount=Number(data.dailyAmountLimit), count=Number(data.dailyCountLimit);
+    if (!Number.isFinite(amount) || amount<WITHDRAWAL_LIMIT_BOUNDS.minAmount || amount>WITHDRAWAL_LIMIT_BOUNDS.maxAmount) {
+      return fail(res,400,`Daily amount limit must be between ₦${WITHDRAWAL_LIMIT_BOUNDS.minAmount.toLocaleString()} and ₦${WITHDRAWAL_LIMIT_BOUNDS.maxAmount.toLocaleString()}.`,requestId);
+    }
+    if (!Number.isInteger(count) || count<WITHDRAWAL_LIMIT_BOUNDS.minCount || count>WITHDRAWAL_LIMIT_BOUNDS.maxCount) {
+      return fail(res,400,`Daily count limit must be a whole number between ${WITHDRAWAL_LIMIT_BOUNDS.minCount} and ${WITHDRAWAL_LIMIT_BOUNDS.maxCount}.`,requestId);
+    }
+    await pool.query('INSERT INTO platform_settings (key,value,updated_at) VALUES ($1,$2,now()) ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=now()',['withdrawal_daily_amount_limit', JSON.stringify(amount)]);
+    await pool.query('INSERT INTO platform_settings (key,value,updated_at) VALUES ($1,$2,now()) ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=now()',['withdrawal_daily_count_limit', JSON.stringify(count)]);
+    audit(user.user_id,'admin.withdrawal_limits_updated',ip,{ amount, count });
+    return send(res,200,{ limits:{ amount, count }, requestId });
   }
 
   if (approveMatch) {

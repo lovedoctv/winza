@@ -55,7 +55,12 @@ Shared:
   `cash_available` into `pending_withdrawal` (never pays out automatically — staff
   review is a later step). **Blocked with 403 if KYC is required and the caller
   isn't `verified`** — see `platform_settings.kyc_required_for_withdrawal`, a
-  backend-controlled flag, not a client one.
+  backend-controlled flag, not a client one. **Also blocked with 429 if it would
+  exceed the account's rolling 24-hour withdrawal limit** — a fully KYC-verified
+  account still can't drain funds in one shot. Defaults: ₦500,000/day, 5
+  requests/day. Admin/owner-adjustable via `GET`/`PUT
+  /api/v1/admin/withdrawal-limits`, bounded to ₦1,000–₦50,000,000 and 1–50
+  requests — always some cap, never unlimited, same principle as the RTP floor.
 
 A wallet row is still created automatically, in the same transaction as the user
 row, for every new account. There is still no route that lets anyone adjust a

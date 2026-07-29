@@ -209,6 +209,36 @@ async function main() {
       });
       data = await json(res);
       record('RTP set to 96% accepted', res.ok && data.rtp === 0.96, JSON.stringify(data));
+
+      // Withdrawal velocity limits: bounds are enforced on the admin write,
+      // and a lowered limit blocks a withdrawal request before it ever
+      // reaches the balance check — the wallet stays at ₦0 in sandbox (no
+      // payment processor to fund it), so this is the only way to exercise
+      // the block without a real deposit.
+      res = await fetch(`${BASE_URL}/api/v1/admin/withdrawal-limits`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` },
+        body: JSON.stringify({ dailyAmountLimit: 1, dailyCountLimit: 5 }),
+      });
+      record('withdrawal amount limit below bounds rejected (400)', res.status === 400);
+
+      res = await fetch(`${BASE_URL}/api/v1/admin/withdrawal-limits`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` },
+        body: JSON.stringify({ dailyAmountLimit: 1000, dailyCountLimit: 5 }),
+      });
+      record('withdrawal amount limit set to ₦1,000', res.ok);
+
+      res = await fetch(`${BASE_URL}/api/v1/wallet/withdrawal-requests`, {
+        method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ amount: 5000 }),
+      });
+      data = await json(res);
+      record('withdrawal above the daily amount limit is blocked (429)', res.status === 429 && /amount limit/i.test(data.error || ''), JSON.stringify(data));
+
+      res = await fetch(`${BASE_URL}/api/v1/admin/withdrawal-limits`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` },
+        body: JSON.stringify({ dailyAmountLimit: 500000, dailyCountLimit: 5 }),
+      });
+      record('withdrawal limits restored to defaults', res.ok);
     }
   } else {
     console.log('(skipping admin-approval checks — set STAFF_EMAIL/STAFF_PASSWORD to include them)');
