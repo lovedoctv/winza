@@ -608,10 +608,10 @@
       <div class="vip-badge" id="vipBadge">VIP: Bronze</div>
     </div>
     <div class="profile-stats-grid">
-      <div class="profile-stat-card"><span class="val" id="profTickets">0</span><span class="lab">Tickets</span></div>
-      <div class="profile-stat-card"><span class="val" id="profWon">₦0</span><span class="lab">Total Won</span></div>
-      <div class="profile-stat-card"><span class="val" id="profStreak">0</span><span class="lab">Best Streak</span></div>
-      <div class="profile-stat-card"><span class="val" id="profWagered">₦0</span><span class="lab">Total Wagered</span></div>
+      <div class="profile-stat-card"><span class="val" id="profTickets">0</span><span class="lab">🎟 Available Tickets</span></div>
+      <div class="profile-stat-card"><span class="val" id="profStreak">0</span><span class="lab">🔥 Current Streak</span></div>
+      <div class="profile-stat-card"><span class="val" id="profLevelPct">0%</span><span class="lab" id="profLevelLab">⭐ Level Progress</span></div>
+      <div class="profile-stat-card"><span class="val" id="profNextReward">0</span><span class="lab">🎁 Next Reward (pts)</span></div>
     </div>
     <div class="loyalty-card">
       <h3>🎁 Loyalty Points</h3>
@@ -620,12 +620,19 @@
       <div style="font-size:11px;color:var(--chalk-dim);margin-bottom:10px;">Earn 1 point per ₦100 staked. Redeem 500 pts for ₦1,000.</div>
       <button class="btn-redeem" id="redeemBtn" onclick="redeemLoyalty()">Redeem 500 pts → ₦1,000</button>
     </div>
+    <div class="loyalty-card">
+      <h3>🏅 Achievement Progress</h3>
+      <div class="loyalty-readout"><span><strong id="achUnlocked">0</strong> of <strong id="achTotal">0</strong> unlocked</span></div>
+      <div class="loyalty-bar-wrap"><div class="loyalty-bar-fill" id="achFill"></div></div>
+      <button class="btn-redeem" onclick="switchTab('hub')">View all achievements →</button>
+    </div>
     <div class="referral-card">
       <h3>👥 Referral Program</h3>
       <div class="referral-code" id="referralCode" onclick="copyReferral()">WINZA2026</div>
       <div style="font-size:11px;color:var(--chalk-dim);text-align:center;margin-bottom:4px;">Tap to copy code</div>
       <div class="referral-info"><span>Friends: <strong id="refCount">0</strong></span><span>Earned: <strong id="refEarnings">₦0</strong></span></div>
     </div>
+    <button class="btn-redeem" style="background:var(--deep-plum);color:var(--chalk);border:1px solid var(--plum-line);" onclick="switchTab('hub')">📊 View Full Statistics</button>
   </div>
 
   <div class="tab-panel" id="tab-leaderboard">
@@ -644,7 +651,7 @@
     <div class="premium-card"><h3>Daily Lucky Spin</h3><div class="wheel-mini" id="luckyWheel"><span id="luckyWheelText">FREE<br>SPIN</span></div><p class="subtle" id="luckySpinTimer"></p><button class="claim-btn" id="luckySpinBtn" onclick="spinLuckyWheel()">Spin for free</button></div>
     <div class="premium-card"><h3>Lucky Box</h3><p class="subtle" id="luckyBoxStatus">Spin 10 games to unlock a box.</p><button class="claim-btn" id="luckyBoxBtn" onclick="openLuckyBox()">Open Lucky Box</button></div>
     <div class="premium-card"><h3>Achievements</h3><div id="achievementList"></div></div>
-    <div class="premium-card"><h3>Player Statistics</h3><div class="stat-grid" id="enhancedStats"></div></div>
+    <div class="premium-card"><h3>📊 Lifetime Statistics</h3><div class="stat-grid" id="enhancedStats"></div></div>
     <div class="premium-card"><h3>Promo Code</h3><div class="row-head"><input id="promoInput" placeholder="WELCOME100" style="flex:1"><button class="mini-action" onclick="redeemPromo()">Redeem</button></div><p class="subtle">Try WELCOME100, WINZA2026, or VIP500.</p></div>
     <div class="premium-card"><h3>Friends & Tournament</h3><div class="row-head"><span>Friends online: <b id="friendsOnline">3</b></span><button class="mini-action" onclick="inviteFriend()">Invite</button></div><p class="subtle">Community Jackpot Sprint · 1,248 players · Prize pool ₦5,000,000 · Rank #<span id="tournamentRank">—</span></p></div>
     <div class="premium-card"><h3>Live Winners</h3><div id="liveFeed"></div></div>
@@ -812,9 +819,13 @@
     profileAvatar: document.getElementById('profileAvatar'),
     vipBadge: document.getElementById('vipBadge'),
     profTickets: document.getElementById('profTickets'),
-    profWon: document.getElementById('profWon'),
     profStreak: document.getElementById('profStreak'),
-    profWagered: document.getElementById('profWagered'),
+    profLevelPct: document.getElementById('profLevelPct'),
+    profLevelLab: document.getElementById('profLevelLab'),
+    profNextReward: document.getElementById('profNextReward'),
+    achUnlocked: document.getElementById('achUnlocked'),
+    achTotal: document.getElementById('achTotal'),
+    achFill: document.getElementById('achFill'),
     loyaltyPoints: document.getElementById('loyaltyPoints'),
     loyaltyNext: document.getElementById('loyaltyNext'),
     loyaltyFill: document.getElementById('loyaltyFill'),
@@ -1256,14 +1267,26 @@
     const vipIdx = vipFromWagered(state.totalWagered);
     el.vipBadge.textContent = 'VIP: ' + VIP_TIERS[vipIdx].name;
     el.profTickets.textContent = state.ticketsBought;
-    el.profWon.textContent = formatMoney(state.totalWon);
-    el.profStreak.textContent = state.bestStreak;
-    el.profWagered.textContent = formatMoney(state.totalWagered);
-    el.loyaltyPoints.textContent = state.loyaltyPoints;
+    el.profStreak.textContent = state.streak;
+    const levelIdx = levelFromXp(state.xp), levelCur = LEVELS[levelIdx], levelNext = LEVELS[levelIdx + 1];
+    if (levelNext) {
+      const pct = Math.round(clamp((state.xp - levelCur.xp) / (levelNext.xp - levelCur.xp), 0, 1) * 100);
+      el.profLevelPct.textContent = pct + '%';
+      el.profLevelLab.textContent = `⭐ To Level ${levelIdx + 2}`;
+    } else {
+      el.profLevelPct.textContent = 'MAX';
+      el.profLevelLab.textContent = '⭐ ' + levelCur.name;
+    }
     const nextReward = 500 - (state.loyaltyPoints % 500);
+    el.profNextReward.textContent = nextReward;
+    el.loyaltyPoints.textContent = state.loyaltyPoints;
     el.loyaltyNext.textContent = nextReward;
     el.loyaltyFill.style.width = ((state.loyaltyPoints % 500) / 500 * 100) + '%';
     el.redeemBtn.disabled = state.loyaltyPoints < 500;
+    const achUnlocked = ACHIEVEMENTS.filter(([, , fn, target]) => fn(state) >= target).length;
+    el.achUnlocked.textContent = achUnlocked;
+    el.achTotal.textContent = ACHIEVEMENTS.length;
+    el.achFill.style.width = (achUnlocked / ACHIEVEMENTS.length * 100) + '%';
     el.referralCode.textContent = state.referralCode;
     el.refCount.textContent = state.referralCount;
     el.refEarnings.textContent = formatMoney(state.referralEarnings);
@@ -1905,7 +1928,7 @@
     const box=document.getElementById('luckyBoxStatus'),boxBtn=document.getElementById('luckyBoxBtn');if(box){const spins=state.ticketsBought%10;box.textContent=state.enhance.luckyBoxes?`${state.enhance.luckyBoxes} Lucky Box ready to open!`:`${spins}/10 spins toward your next Lucky Box.`;boxBtn.disabled=!state.enhance.luckyBoxes;}
     const ach=document.getElementById('achievementList');if(ach) ach.innerHTML=ACHIEVEMENTS.map(([n,icon,fn,target])=>{const v=Math.min(target,fn(state));return `<div class="achievement-row"><div class="row-head"><span>${icon} ${n}</span><b>${v>=target?'Unlocked':'Locked'}</b></div><div class="progress"><i style="width:${Math.min(100,v/target*100)}%"></i></div></div>`}).join('');
     const played=state.ticketsBought, wins=state.history.filter(h=>h.win).length, avg=played?Math.round(state.totalWagered/played):0, profit=state.totalWon-state.totalWagered;
-    const stats=document.getElementById('enhancedStats');if(stats) stats.innerHTML=[['Win rate',played?(wins/played*100).toFixed(1)+'%':'0%'],['Loss rate',played?((played-wins)/played*100).toFixed(1)+'%':'0%'],['Average bet','₦'+avg.toLocaleString()],['Profit',(profit<0?'-':'')+'₦'+Math.abs(profit).toLocaleString()],['Games played',played],['Best streak',state.bestStreak]].map(x=>`<div class="stat-mini"><b>${x[1]}</b><small>${x[0]}</small></div>`).join('');
+    const stats=document.getElementById('enhancedStats');if(stats) stats.innerHTML=[['Total wagered','₦'+state.totalWagered.toLocaleString()],['Total won','₦'+state.totalWon.toLocaleString()],['Win rate',played?(wins/played*100).toFixed(1)+'%':'0%'],['Loss rate',played?((played-wins)/played*100).toFixed(1)+'%':'0%'],['Average bet','₦'+avg.toLocaleString()],['Profit',(profit<0?'-':'')+'₦'+Math.abs(profit).toLocaleString()],['Games played',played],['Best streak',state.bestStreak]].map(x=>`<div class="stat-mini"><b>${x[1]}</b><small>${x[0]}</small></div>`).join('');
     const luckToday=state.enhance.lastLuckySpin===new Date().toDateString(),lbtn=document.getElementById('luckySpinBtn'),lt=document.getElementById('luckySpinTimer');if(lbtn){lbtn.disabled=luckToday;lbtn.textContent=luckToday?'Available tomorrow':'Spin for free';}if(lt)lt.textContent=luckToday?'Next free spin in '+untilMidnight():'One free spin is ready.';
     const rank=document.getElementById('tournamentRank');if(rank)rank.textContent=Math.max(1,Math.round(1248-(state.balance/1000)));
     const feed=document.getElementById('liveFeed');if(feed)feed.innerHTML=liveFeed.slice(0,6).map(f=>`<div class="feed-row">🎉 <b>${f.name}</b> ${f.text}<small class="subtle" style="float:right">now</small></div>`).join('')||'<div class="subtle">Connecting to live winners…</div>';
