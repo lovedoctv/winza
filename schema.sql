@@ -85,6 +85,27 @@ CREATE TABLE wallet_ledger_entries (
 CREATE INDEX wallet_transactions_wallet_created_idx ON wallet_transactions(wallet_id, created_at DESC);
 CREATE INDEX wallet_ledger_entries_wallet_idx ON wallet_ledger_entries(wallet_id, created_at DESC);
 
+-- Created the moment a player starts a deposit (before the provider has
+-- confirmed anything), so it doubles as a reconciliation trail for
+-- abandoned/failed checkouts and gives the webhook handler something to
+-- look up and verify the expected amount against rather than trusting the
+-- webhook payload alone. wallet_transactions only gets a row once the
+-- webhook actually confirms payment (see server.js / paystack.js / opay.js).
+-- `provider` isn't constrained to a fixed list on purpose — adding another
+-- payment provider later shouldn't require a migration on this table.
+CREATE TABLE deposit_intents (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+  reference TEXT NOT NULL UNIQUE,
+  amount NUMERIC(18,2) NOT NULL CHECK (amount > 0),
+  provider TEXT NOT NULL DEFAULT 'paystack',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','failed')),
+  completed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX deposit_intents_user_idx ON deposit_intents(user_id, created_at DESC);
+
 -- One-time codes for phone verification. Stored hashed, single-use, short-lived.
 CREATE TABLE phone_otp_codes (
   id UUID PRIMARY KEY,
@@ -110,10 +131,61 @@ CREATE TABLE kyc_submissions (
   reviewed_by UUID REFERENCES users(id),
   reviewed_at TIMESTAMPTZ,
   rejection_reason TEXT,
+  -- Set on approval by server.js's sanctions-screening step (sanctions.js).
+  -- 'not_configured_override' means no screening provider was configured and
+  -- a staff member explicitly acknowledged that instead of it being silently
+  -- treated as clear — see sanctions_screening_detail for their reason.
+  sanctions_screening_status TEXT CHECK (sanctions_screening_status IN ('clear','hit','not_configured_override')),
+  sanctions_screening_detail TEXT,
+  sanctions_screened_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX kyc_submissions_user_idx ON kyc_submissions(user_id, created_at DESC);
 CREATE INDEX kyc_submissions_status_idx ON kyc_submissions(status, created_at);
+
+-- Players authenticate with phone + OTP only (no password), so there's no
+-- "forgot password" flow — but a player who loses access to the phone number
+-- on their account (lost phone, stolen SIM, recycled number) has no way back
+-- in either, since phone_number is a hard unique identifier. This backs a
+-- staff-reviewed recovery path: the player submits identity details plus a
+-- new number, staff compares that against the KYC record on file, and
+-- approval is what actually rewrites users.phone_number (see server.js).
+CREATE TABLE phone_recovery_requests (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  old_phone_number TEXT NOT NULL,
+  new_phone_number TEXT NOT NULL,
+  full_name TEXT NOT NULL,
+  date_of_birth DATE NOT NULL,
+  id_type TEXT NOT NULL CHECK (id_type IN ('nin','bvn','drivers_license','passport','voters_card')),
+  id_number TEXT NOT NULL,
+  reason TEXT,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+  reviewed_by UUID REFERENCES users(id),
+  reviewed_at TIMESTAMPTZ,
+  rejection_reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX phone_recovery_requests_status_idx ON phone_recovery_requests(status, created_at);
+CREATE INDEX phone_recovery_requests_user_idx ON phone_recovery_requests(user_id, created_at DESC);
+
+-- Server-enforced responsible-gambling limits. Previously this lived only in
+-- the browser's localStorage, which meant clearing site data or switching
+-- devices silently undid a self-exclusion or cool-off — exactly the failure
+-- mode these controls are supposed to be immune to. See server.js: OTP login
+-- and withdrawal requests both check this table now.
+CREATE TABLE player_limits (
+  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  daily_stake_limit NUMERIC(18,2),
+  -- Loosening or removing a limit is deferred 24h (see server.js) so it
+  -- can't be undone in the same moment of impulse that prompted it.
+  -- Tightening a limit, or setting one for the first time, is immediate.
+  pending_daily_stake_limit NUMERIC(18,2),
+  pending_stake_limit_effective_at TIMESTAMPTZ,
+  cool_off_until TIMESTAMPTZ,
+  self_excluded_until TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- Backend-controlled feature flags (e.g. "is KYC required for withdrawal"),
 -- so behavior can change without a redeploy.
@@ -122,7 +194,17 @@ CREATE TABLE platform_settings (
   value JSONB NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Sandbox/staging convenience only. server.js hard-codes this to true and
+-- never reads this row once WINZA_MODE=live, so changing this value has no
+-- effect on a real-money deployment — see the withdrawal-requests handler.
 INSERT INTO platform_settings (key, value) VALUES ('kyc_required_for_withdrawal', 'true'::jsonb);
+
+-- Fraud/velocity caps on withdrawals: even a fully KYC-verified account
+-- shouldn't be able to drain funds in one shot. Admin/owner-adjustable via
+-- /api/v1/admin/withdrawal-limits, always bounded (see server.js) — never
+-- unlimited regardless of what an admin sets.
+INSERT INTO platform_settings (key, value) VALUES ('withdrawal_daily_amount_limit', '500000'::jsonb);
+INSERT INTO platform_settings (key, value) VALUES ('withdrawal_daily_count_limit', '5'::jsonb);
 
 -- Defense-in-depth for the RTP (Return to Player) floor introduced ahead of
 -- a future real-money launch: the server already validates 0.90-1.00 before
@@ -151,25 +233,3 @@ CREATE TRIGGER platform_settings_rtp_bounds
 
 -- Default RTP: 96%, within the 90-100% floor/ceiling above.
 INSERT INTO platform_settings (key, value) VALUES ('game_rtp', '0.96'::jsonb);
-
--- Tracks a deposit from the moment it's initialized with a payment provider
--- through to confirmation. Kept separate from wallet_transactions because a
--- payment intent can exist (and fail or be abandoned) without ever becoming
--- a posted ledger entry — the wallet is only credited once a provider
--- confirms success (see creditDeposit() in server.js).
-CREATE TABLE payment_intents (
-  id UUID PRIMARY KEY,
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-  wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE RESTRICT,
-  provider TEXT NOT NULL CHECK (provider IN ('paystack','opay')),
-  provider_reference TEXT NOT NULL,
-  amount NUMERIC(18,2) NOT NULL CHECK (amount > 0),
-  currency CHAR(3) NOT NULL DEFAULT 'NGN',
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','success','failed')),
-  raw_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (provider, provider_reference)
-);
-CREATE INDEX payment_intents_user_idx ON payment_intents(user_id, created_at DESC);
-CREATE INDEX payment_intents_status_idx ON payment_intents(status, created_at);

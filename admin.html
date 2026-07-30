@@ -78,8 +78,16 @@
   th { color: var(--chalk-dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
   .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; }
   .badge-pending { background: rgba(245,166,35,0.18); color: var(--ijebu-gold); }
-  .badge-verified { background: rgba(31,169,123,0.18); color: var(--palm-green); }
+  .badge-verified, .badge-approved { background: rgba(31,169,123,0.18); color: var(--palm-green); }
   .badge-rejected { background: rgba(232,82,60,0.18); color: var(--market-coral); }
+  .queue-tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+  .queue-tab {
+    padding: 6px 12px; border-radius: 8px; border: 1px solid var(--plum-line);
+    background: transparent; color: var(--chalk-dim); font-size: 13px;
+  }
+  .queue-tab.active { background: var(--plum-line); color: var(--chalk); font-weight: 600; }
+  .kyc-match { color: var(--palm-green); }
+  .kyc-mismatch { color: var(--market-coral); }
   .row-actions { display: flex; gap: 8px; align-items: flex-start; }
   .reject-panel { margin-top: 8px; display: none; gap: 8px; }
   .reject-panel.open { display: flex; }
@@ -120,7 +128,11 @@
   </div>
 
   <main id="mainScreen" style="display:none;">
-    <div class="tabs">
+    <div class="queue-tabs">
+      <button class="queue-tab active" data-queue="kyc" onclick="switchQueue('kyc')">KYC submissions</button>
+      <button class="queue-tab" data-queue="recovery" onclick="switchQueue('recovery')">Phone recovery requests</button>
+    </div>
+    <div class="tabs" id="statusTabs">
       <button class="tab active" data-status="pending" onclick="switchTab('pending')">Pending</button>
       <button class="tab" data-status="verified" onclick="switchTab('verified')">Verified</button>
       <button class="tab" data-status="rejected" onclick="switchTab('rejected')">Rejected</button>
@@ -133,6 +145,10 @@
 <script>
   const tokenKey = 'wz_staff_token';
   let currentTab = 'pending';
+  let currentQueue = 'kyc';
+  // KYC's non-pending status is "verified"; phone recovery's is "approved" —
+  // same tab UI, different label per queue.
+  const STATUS_LABELS = { kyc: ['pending', 'verified', 'rejected'], recovery: ['pending', 'approved', 'rejected'] };
 
   function getToken() { return sessionStorage.getItem(tokenKey); }
   function toast(message) {
@@ -193,6 +209,17 @@
     loadQueue();
   }
 
+  function switchQueue(queue) {
+    currentQueue = queue;
+    currentTab = 'pending';
+    document.querySelectorAll('.queue-tab').forEach(t => t.classList.toggle('active', t.dataset.queue === queue));
+    const labels = STATUS_LABELS[queue];
+    document.getElementById('statusTabs').innerHTML = labels.map((status, i) =>
+      `<button class="tab${i === 0 ? ' active' : ''}" data-status="${status}" onclick="switchTab('${status}')">${status[0].toUpperCase() + status.slice(1)}</button>`
+    ).join('');
+    loadQueue();
+  }
+
   function switchTab(status) {
     currentTab = status;
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.status === status));
@@ -203,8 +230,13 @@
     const container = document.getElementById('queueContainer');
     container.innerHTML = '<div class="queue-empty">Loading…</div>';
     try {
-      const data = await api('/api/v1/admin/kyc/submissions?status=' + currentTab);
-      renderQueue(data.submissions);
+      if (currentQueue === 'kyc') {
+        const data = await api('/api/v1/admin/kyc/submissions?status=' + currentTab);
+        renderQueue(data.submissions);
+      } else {
+        const data = await api('/api/v1/admin/phone-recovery-requests?status=' + currentTab);
+        renderRecoveryQueue(data.requests);
+      }
     } catch (e) {
       container.innerHTML = '<div class="queue-empty">' + esc(e.message) + '</div>';
     }
@@ -235,6 +267,13 @@
       } else {
         actionsCell = '<span class="muted">Reviewed ' + new Date(s.reviewedAt).toLocaleString() + '</span>';
       }
+      const screeningCell = s.status === 'verified'
+        ? (s.sanctionsScreeningStatus === 'clear'
+            ? '<span class="kyc-match">Clear</span>'
+            : s.sanctionsScreeningStatus === 'not_configured_override'
+              ? `<span class="kyc-mismatch">Unscreened — override</span><div class="muted">${esc(s.sanctionsScreeningDetail || '')}</div>`
+              : '<span class="muted">—</span>')
+        : '<span class="muted">—</span>';
       return `
         <tr>
           <td>${esc(s.fullName)}<div class="muted">${esc(s.displayName)}</div></td>
@@ -243,12 +282,68 @@
           <td>${esc(s.idType.toUpperCase())}<div class="muted">${esc(s.idNumber)}</div></td>
           <td>${esc(submitted)}</td>
           <td>${badge}</td>
+          <td>${screeningCell}</td>
           <td>${actionsCell}</td>
         </tr>`;
     }).join('');
     container.innerHTML = `
       <table>
-        <thead><tr><th>Name</th><th>Phone</th><th>DOB</th><th>ID</th><th>Submitted</th><th>Status</th><th>Action</th></tr></thead>
+        <thead><tr><th>Name</th><th>Phone</th><th>DOB</th><th>ID</th><th>Submitted</th><th>Status</th><th>Screening</th><th>Action</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  // Compares a submitted identity field against what's on file from a
+  // verified KYC submission, so staff can see agreement/mismatch at a glance
+  // instead of reading two columns and comparing by eye.
+  function matchSpan(submitted, onFile) {
+    if (onFile === undefined || onFile === null) return esc(submitted);
+    const same = String(submitted).trim().toLowerCase() === String(onFile).trim().toLowerCase();
+    return `<span class="${same ? 'kyc-match' : 'kyc-mismatch'}">${esc(submitted)}</span>`;
+  }
+
+  function renderRecoveryQueue(requests) {
+    const container = document.getElementById('queueContainer');
+    if (!requests.length) {
+      container.innerHTML = '<div class="queue-empty">No ' + currentTab + ' phone recovery requests.</div>';
+      return;
+    }
+    const rows = requests.map(r => {
+      const submitted = new Date(r.submittedAt).toLocaleString();
+      const badge = '<span class="badge badge-' + r.status + '">' + r.status + '</span>';
+      const kyc = r.kycOnFile;
+      let actionsCell;
+      if (r.status === 'pending') {
+        actionsCell = `
+          <div class="row-actions">
+            <button class="btn btn-approve" onclick="approveRecovery('${r.id}')">Approve</button>
+            <button class="btn btn-reject" onclick="toggleReject('${r.id}')">Reject</button>
+          </div>
+          <div class="reject-panel" id="reject-${r.id}">
+            <input type="text" id="reason-${r.id}" placeholder="Reason (shown to reviewer log)" maxlength="300" />
+            <button class="btn btn-reject" onclick="rejectRecovery('${r.id}')">Confirm reject</button>
+          </div>`;
+      } else if (r.status === 'rejected') {
+        actionsCell = '<span class="muted">' + esc(r.rejectionReason || 'No reason given') + '</span>';
+      } else {
+        actionsCell = '<span class="muted">Reviewed ' + new Date(r.reviewedAt).toLocaleString() + '</span>';
+      }
+      return `
+        <tr>
+          <td>${matchSpan(r.fullName, kyc && kyc.fullName)}<div class="muted">${esc(r.displayName)}</div></td>
+          <td>${esc(r.oldPhoneNumber)} &rarr; ${esc(r.newPhoneNumber)}</td>
+          <td>${matchSpan(r.dateOfBirth, kyc && kyc.dateOfBirth)}</td>
+          <td>${matchSpan(r.idType.toUpperCase(), kyc && kyc.idType && kyc.idType.toUpperCase())}<div class="muted">${matchSpan(r.idNumber, kyc && kyc.idNumber)}</div></td>
+          <td>${kyc ? '<span class="muted">On file</span>' : '<span class="kyc-mismatch">No verified KYC on file</span>'}</td>
+          <td>${esc(r.reason || '—')}</td>
+          <td>${esc(submitted)}</td>
+          <td>${badge}</td>
+          <td>${actionsCell}</td>
+        </tr>`;
+    }).join('');
+    container.innerHTML = `
+      <table>
+        <thead><tr><th>Name</th><th>Old &rarr; new phone</th><th>DOB</th><th>ID</th><th>KYC match</th><th>Reason</th><th>Submitted</th><th>Status</th><th>Action</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
   }
@@ -262,13 +357,45 @@
       await api(`/api/v1/admin/kyc/submissions/${id}/approve`, { method: 'POST', body: '{}' });
       toast('Approved.');
       loadQueue();
-    } catch (e) { toast(e.message); }
+    } catch (e) {
+      // No sanctions-screening provider configured on this deployment — the
+      // server refuses to silently treat that as clear and asks for an
+      // explicit, logged reason instead. See sanctions.js / README.
+      if (/sanctionsScreeningOverrideReason/i.test(e.message)) {
+        const reason = prompt('No sanctions-screening provider is configured. Enter a reason to approve anyway (recorded in the audit log and on the submission):');
+        if (!reason || reason.trim().length < 10) { toast('Approval cancelled — reason must be at least 10 characters.'); return; }
+        try {
+          await api(`/api/v1/admin/kyc/submissions/${id}/approve`, { method: 'POST', body: JSON.stringify({ sanctionsScreeningOverrideReason: reason.trim() }) });
+          toast('Approved (unscreened — override recorded).');
+          loadQueue();
+        } catch (e2) { toast(e2.message); }
+        return;
+      }
+      toast(e.message);
+    }
   }
 
   async function reject(id) {
     const reason = document.getElementById('reason-' + id).value.trim();
     try {
       await api(`/api/v1/admin/kyc/submissions/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) });
+      toast('Rejected.');
+      loadQueue();
+    } catch (e) { toast(e.message); }
+  }
+
+  async function approveRecovery(id) {
+    try {
+      await api(`/api/v1/admin/phone-recovery-requests/${id}/approve`, { method: 'POST', body: '{}' });
+      toast('Approved. Account now signs in with the new number.');
+      loadQueue();
+    } catch (e) { toast(e.message); }
+  }
+
+  async function rejectRecovery(id) {
+    const reason = document.getElementById('reason-' + id).value.trim();
+    try {
+      await api(`/api/v1/admin/phone-recovery-requests/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) });
       toast('Rejected.');
       loadQueue();
     } catch (e) { toast(e.message); }

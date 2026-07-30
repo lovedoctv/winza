@@ -7,11 +7,20 @@ const auth = require('./auth');
 const wallet = require('./wallet');
 const otpLib = require('./otp');
 const rtpConfig = require('./rtp-config');
-const payments = require('./payments');
+const sanctions = require('./sanctions');
+const paystackLib = require('./paystack');
+const opayLib = require('./opay');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
 const MODE = process.env.WINZA_MODE || 'sandbox';
+// Separate from WINZA_MODE on purpose: WINZA_MODE stays 'sandbox' all the way
+// through the public Play Store launch (no real money yet), so it can't be
+// what gates a code-in-the-response debug path. This must be explicitly
+// opted into per-deployment and left unset anywhere the app is reachable by
+// real users, or anyone can request an OTP for any phone number and read the
+// code straight back out of the API response.
+const OTP_DEV_ECHO = process.env.OTP_DEV_ECHO === 'true';
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const root = __dirname;
@@ -40,19 +49,16 @@ function throttled(ip) { const now=Date.now(), record=attempts.get(ip)||{count:0
 // when there's no proxy in front (e.g. running locally).
 function clientIp(req) { const forwarded=req.headers['x-forwarded-for']; if (forwarded) return String(forwarded).split(',')[0].trim(); return req.socket.remoteAddress; }
 async function body(req) { return new Promise((resolve,reject)=>{let raw='';req.on('data',c=>{raw+=c;if(raw.length>16_384)req.destroy();});req.on('end',()=>{try{resolve(raw?JSON.parse(raw):{});}catch{reject(new Error('Invalid JSON body'));}});req.on('error',reject);}); }
-// Payment webhooks must be verified against the exact bytes the provider
-// signed — parsing to JSON first and re-stringifying can reorder keys or
-// change whitespace and silently break signature verification.
+// Separate from body() on purpose: webhook signature verification (see
+// paystack.js / opay.js) must run over the exact raw bytes received, before
+// any JSON parsing — parsing and re-stringifying can reorder keys or change
+// whitespace and silently break an HMAC computed over the original body.
 async function rawBody(req) { return new Promise((resolve,reject)=>{let raw='';req.on('data',c=>{raw+=c;if(raw.length>65_536)req.destroy();});req.on('end',()=>resolve(raw));req.on('error',reject);}); }
-// Absolute origin used to build provider callback/webhook URLs. Prefer an
-// explicit APP_BASE_URL (needed behind most proxies/CDNs) and fall back to
-// the request's own Host header for local/simple deployments.
-function baseUrl(req) { if (process.env.APP_BASE_URL) return process.env.APP_BASE_URL.replace(/\/$/,''); const proto=req.headers['x-forwarded-proto']||'http'; return `${proto}://${req.headers.host}`; }
 function ready(res, requestId) { if (!pool || !JWT_SECRET || JWT_SECRET.length < 32) { fail(res,503,'Authentication service is not configured.',requestId); return false; } return true; }
 async function sessionFrom(req) { const token=(req.headers.authorization||'').replace(/^Bearer\s+/i,''); const payload=auth.verify(token,JWT_SECRET); const { rows }=await pool.query('SELECT s.id,u.id AS user_id,u.email,u.phone_number,u.display_name,u.role,u.is_active,u.kyc_status FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND s.expires_at>now() AND s.revoked_at IS NULL',[payload.sid]); if(!rows[0]||!rows[0].is_active)throw new Error('Unauthorized'); return rows[0]; }
 function issueSession(user) { const sid=crypto.randomUUID(), expires=new Date(Date.now()+8*60*60_000); return pool.query('INSERT INTO auth_sessions (id,user_id,expires_at) VALUES ($1,$2,$3)',[sid,user.id,expires]).then(()=>({accessToken:auth.sign({sub:user.id,sid,role:user.role},JWT_SECRET,8*60*60),expiresAt:expires.toISOString()})); }
 function safeUser(row) { return { id:row.id||row.user_id,email:row.email,phoneNumber:row.phone_number,displayName:row.display_name,role:row.role,mfaEnabled:Boolean(row.mfa_enabled_at),kycStatus:row.kyc_status }; }
-function safeSubmission(row) { return { id:row.id,status:row.status,idType:row.id_type,submittedAt:row.created_at,reviewedAt:row.reviewed_at,rejectionReason:row.rejection_reason }; }
+function safeSubmission(row) { return { id:row.id,status:row.status,idType:row.id_type,submittedAt:row.created_at,reviewedAt:row.reviewed_at,rejectionReason:row.rejection_reason,sanctionsScreeningStatus:row.sanctions_screening_status,sanctionsScreeningDetail:row.sanctions_screening_detail }; }
 async function getSetting(key, fallback) { const { rows }=await pool.query('SELECT value FROM platform_settings WHERE key=$1',[key]); return rows[0] ? rows[0].value : fallback; }
 // The authoritative RTP for a future real-money launch. Validated on the way
 // out, not just on the way in: a database row can only be written within
@@ -69,9 +75,84 @@ async function getGameRtp() {
 }
 function ageFromDob(dobStr) { const dob=new Date(dobStr+'T00:00:00Z'); if(Number.isNaN(dob.getTime()))return 0; const now=new Date(); let age=now.getUTCFullYear()-dob.getUTCFullYear(); const m=now.getUTCMonth()-dob.getUTCMonth(); if(m<0||(m===0&&now.getUTCDate()<dob.getUTCDate()))age--; return age; }
 
+// Responsible-gambling limits, read fresh on every login/withdrawal attempt
+// rather than cached anywhere client-side. If a scheduled stake-limit
+// loosening/removal has come due, applies it here so every caller sees the
+// current, correct value without a separate cron job.
+async function getEffectiveLimits(userId) {
+  const { rows } = await pool.query('SELECT * FROM player_limits WHERE user_id=$1',[userId]);
+  let row = rows[0];
+  if (row && row.pending_daily_stake_limit !== null && row.pending_stake_limit_effective_at && new Date(row.pending_stake_limit_effective_at) <= new Date()) {
+    const updated = await pool.query('UPDATE player_limits SET daily_stake_limit=$1, pending_daily_stake_limit=NULL, pending_stake_limit_effective_at=NULL, updated_at=now() WHERE user_id=$2 RETURNING *',[row.pending_daily_stake_limit, userId]);
+    row = updated.rows[0];
+  }
+  return row || null;
+}
+function safeLimits(row) {
+  if (!row) return { dailyStakeLimit:null, pendingDailyStakeLimit:null, pendingEffectiveAt:null, coolOffUntil:null, selfExcludedUntil:null };
+  return {
+    dailyStakeLimit: row.daily_stake_limit===null?null:Number(row.daily_stake_limit),
+    pendingDailyStakeLimit: row.pending_daily_stake_limit===null?null:Number(row.pending_daily_stake_limit),
+    pendingEffectiveAt: row.pending_stake_limit_effective_at,
+    coolOffUntil: row.cool_off_until,
+    selfExcludedUntil: row.self_excluded_until,
+  };
+}
+// Self-exclusion and cool-off are checked at the two points that matter most
+// given there's no server-mediated wagering endpoint yet (gameplay itself is
+// still a client-side simulation, see README): logging in at all, and
+// withdrawing funds. Neither can be reversed early through this app — that's
+// the point of a cooling-off period.
+function restrictionFromLimits(row) {
+  if (!row) return null;
+  const now = Date.now();
+  if (row.self_excluded_until && new Date(row.self_excluded_until).getTime() > now) return { type:'self_exclusion', until:row.self_excluded_until };
+  if (row.cool_off_until && new Date(row.cool_off_until).getTime() > now) return { type:'cool_off', until:row.cool_off_until };
+  return null;
+}
+function restrictionMessage(restriction) {
+  return restriction.type==='self_exclusion'
+    ? `Self-exclusion is active until ${new Date(restriction.until).toISOString()}. This cannot be reversed early.`
+    : `Cool-off is active until ${new Date(restriction.until).toISOString()}.`;
+}
+// Fraud/velocity caps on withdrawals: even a fully KYC-verified account
+// shouldn't be able to drain funds in one shot — a compromised session or an
+// abused account is exactly the case this exists for. Admin/owner-adjustable
+// (see /api/v1/admin/withdrawal-limits), bounded the same way the RTP floor
+// is: never unlimited, regardless of what an admin sets.
+async function getWithdrawalLimits() {
+  const amount = Number(await getSetting('withdrawal_daily_amount_limit', 500000));
+  const count = Number(await getSetting('withdrawal_daily_count_limit', 5));
+  return {
+    amount: Number.isFinite(amount) && amount>0 ? amount : 500000,
+    count: Number.isFinite(count) && count>0 ? count : 5,
+  };
+}
+// Sums this wallet's withdrawal-request amounts (the pending_withdrawal side
+// of the ledger entry, not the mirrored negative cash_available side) over
+// the trailing 24 hours. Reversed/rejected withdrawals still count here on
+// purpose — the cap is about how much a wallet has *requested*, not how much
+// ultimately got paid out, so an account can't probe the limit by requesting
+// and cancelling.
+async function getRecentWithdrawalActivity(walletId) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(le.amount),0)::numeric AS total, COUNT(*)::int AS count
+     FROM wallet_ledger_entries le JOIN wallet_transactions wt ON wt.id=le.transaction_id
+     WHERE wt.wallet_id=$1 AND wt.type='withdrawal_request' AND le.balance_type='pending_withdrawal' AND wt.created_at > now() - interval '24 hours'`,
+    [walletId]
+  );
+  return { total: Number(rows[0].total), count: rows[0].count };
+}
+
 async function handleAuth(req,res,url,requestId,ip) {
   if (!ready(res,requestId)) return;
-  if (throttled(ip)) return fail(res,429,'Too many attempts. Try again later.',requestId);
+  // Scoped to state-changing/credential-testing requests (OTP, login,
+  // password reset, mutations) — not read-only GETs. A GET under an already-
+  // valid session (checking your own balance, KYC status, limits) isn't a
+  // brute-force vector and shouldn't share a budget with the traffic this
+  // exists to slow down; gating it too just means a normal multi-action
+  // session behind a shared IP/proxy can lock itself out.
+  if (req.method!=='GET' && throttled(ip)) return fail(res,429,'Too many attempts. Try again later.',requestId);
   const data=await body(req);
 
   // --- Phone + OTP: this is the only way players register or log in now.
@@ -86,9 +167,9 @@ async function handleAuth(req,res,url,requestId,ip) {
     audit(null,'auth.otp_requested',ip,{phone});
     const payload={ message:'If that number is valid, a verification code has been sent.', requestId };
     // No SMS provider is configured yet. Rather than leave you unable to test
-    // this at all, the code is echoed back here — but ONLY outside live mode.
-    // This branch is structurally impossible once WINZA_MODE is 'live'.
-    if (!delivery.delivered && MODE !== 'live') payload.devCode=code;
+    // this at all, the code can be echoed back here — but only when explicitly
+    // opted into via OTP_DEV_ECHO, and never in live mode regardless.
+    if (!delivery.delivered && MODE !== 'live' && OTP_DEV_ECHO) payload.devCode=code;
     return send(res,202,payload);
   }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/otp/verify') {
@@ -120,9 +201,55 @@ async function handleAuth(req,res,url,requestId,ip) {
       await client.query('COMMIT');
     } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
     if (!user.is_active) return fail(res,403,'This account has been disabled.',requestId);
+    // A brand-new account can't have a player_limits row yet, so this only
+    // ever blocks a returning player — which is exactly who self-exclusion
+    // and cool-off are for.
+    if (!isNewAccount) {
+      const restriction=restrictionFromLimits(await getEffectiveLimits(user.id));
+      if (restriction) {
+        audit(user.id, restriction.type==='self_exclusion'?'auth.login_blocked_self_exclusion':'auth.login_blocked_cool_off', ip);
+        return fail(res,403,restrictionMessage(restriction),requestId);
+      }
+    }
     const session=await issueSession(user);
     audit(user.id, isNewAccount?'account.registered_via_otp':'auth.login_succeeded', ip);
     return send(res,200,{ user:safeUser(user), isNewAccount, ...session, requestId });
+  }
+
+  // Players have no password, so there's no "forgot password" flow for them —
+  // but losing access to the phone number itself (lost phone, stolen SIM, a
+  // recycled number) leaves them locked out with nothing to fall back on,
+  // since phone_number is a hard unique identifier. This is that recovery
+  // path: unauthenticated (they can't log in, that's the whole problem),
+  // staff-reviewed rather than automated, matching how KYC submissions work.
+  if (req.method==='POST' && url.pathname==='/api/v1/auth/recovery/phone-change-request') {
+    let oldPhone, newPhone;
+    try { oldPhone=otpLib.normalizePhone(data.oldPhone); newPhone=otpLib.normalizePhone(data.newPhone); }
+    catch(e) { return fail(res,400,e.message,requestId); }
+    if (oldPhone===newPhone) return fail(res,400,'New number must be different from the number on file.',requestId);
+    const fullName=String(data.fullName||'').trim(), dob=String(data.dateOfBirth||'').trim(), idType=String(data.idType||'').trim(), idNumber=String(data.idNumber||'').trim(), reason=String(data.reason||'').trim().slice(0,300);
+    if (fullName.length<2||fullName.length>80) return fail(res,400,'Enter your full legal name.',requestId);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dob)) return fail(res,400,'Enter date of birth as YYYY-MM-DD.',requestId);
+    if (ageFromDob(dob)<18) return fail(res,400,'You must be 18 or older.',requestId);
+    if (!['nin','bvn','drivers_license','passport','voters_card'].includes(idType)) return fail(res,400,'Select a valid ID type.',requestId);
+    if (idNumber.length<5||idNumber.length>30) return fail(res,400,'Enter a valid ID number.',requestId);
+    // Telling the requester their claimed new number is already taken is
+    // useful, actionable feedback and doesn't leak anything about the old
+    // (possibly lost) account — safe to answer directly.
+    const { rows:newTaken }=await pool.query('SELECT id FROM users WHERE phone_number=$1',[newPhone]);
+    if (newTaken[0]) return fail(res,409,'That new number is already registered to an account.',requestId);
+    // Same shape as password-reset/request: always return a generic 202 so
+    // the response never confirms whether the old number belongs to an
+    // account, but only actually create a request row when it does.
+    const { rows:existing }=await pool.query('SELECT id FROM users WHERE phone_number=$1 AND is_active=true',[oldPhone]);
+    if (existing[0]) {
+      const { rows:pending }=await pool.query(`SELECT id FROM phone_recovery_requests WHERE user_id=$1 AND status='pending'`,[existing[0].id]);
+      if (!pending[0]) {
+        await pool.query('INSERT INTO phone_recovery_requests (id,user_id,old_phone_number,new_phone_number,full_name,date_of_birth,id_type,id_number,reason) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',[crypto.randomUUID(),existing[0].id,oldPhone,newPhone,fullName,dob,idType,idNumber,reason||null]);
+        audit(existing[0].id,'account.phone_recovery_requested',ip,{oldPhone,newPhone});
+      }
+    }
+    return send(res,202,{ message:'If that account exists, your request has been submitted for staff review.', requestId });
   }
 
   // Email + password registration/login below is for staff accounts
@@ -166,6 +293,42 @@ async function handleAuth(req,res,url,requestId,ip) {
   if (req.method==='GET' && url.pathname==='/api/v1/auth/me') return send(res,200,{user:safeUser(user),requestId});
   if (req.method==='GET' && url.pathname==='/api/v1/wallet/me') { const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId); return send(res,200,{wallet:wallet.safeWallet(row),requestId}); }
 
+  // Deposits stay inert everywhere except a fully-configured live
+  // deployment — /api/v1/public/config's realMoneyEnabled is hardcoded false
+  // regardless of this. winza.html's deposit button does call this endpoint,
+  // but /api/v1/public/config only ever advertises a provider (via
+  // depositProviders) once WINZA_MODE=live and that provider's credentials
+  // are set, so in practice nothing reaches here until that's deliberately
+  // switched on post-launch-checklist.
+  if (req.method==='POST' && url.pathname==='/api/v1/wallet/deposits/initiate') {
+    const provider=String(data.provider||'paystack').toLowerCase();
+    if (!['paystack','opay'].includes(provider)) return fail(res,400,'Select a valid payment provider.',requestId);
+    const providerConfigured = provider==='paystack'
+      ? Boolean(process.env.PAYSTACK_SECRET_KEY)
+      : Boolean(process.env.OPAY_MERCHANT_ID && process.env.OPAY_PUBLIC_KEY && process.env.OPAY_SECRET_KEY);
+    if (MODE!=='live' || !providerConfigured) {
+      return fail(res,403,'Payments are unavailable until the live payment service is configured.',requestId);
+    }
+    const amount=Number(data.amount);
+    if (!Number.isFinite(amount) || amount<100) return fail(res,400,'Enter a valid deposit amount (minimum ₦100).',requestId);
+    const walletRow=await wallet.getWalletByUserId(pool,user.user_id); if(!walletRow)return fail(res,404,'Wallet not found.',requestId);
+    const reference=`winza_dep_${crypto.randomUUID()}`;
+    // Recorded before calling out to the provider — this is the
+    // reconciliation record the webhook looks up and validates against, not
+    // something trusted to appear only after a webhook says so.
+    await pool.query('INSERT INTO deposit_intents (id,user_id,wallet_id,reference,amount,provider) VALUES ($1,$2,$3,$4,$5,$6)',[crypto.randomUUID(),user.user_id,walletRow.id,reference,amount,provider]);
+    try {
+      const result = provider==='paystack'
+        ? await paystackLib.initializeTransaction({ amountNaira:amount, phoneNumber:user.phone_number, reference, callbackUrl:process.env.PAYSTACK_CALLBACK_URL })
+        : await opayLib.initializeTransaction({ amountNaira:amount, reference, returnUrl:process.env.OPAY_CALLBACK_URL });
+      audit(user.user_id,'wallet.deposit_initiated',ip,{reference,amount,provider});
+      return send(res,200,{ authorizationUrl:result.authorizationUrl, reference, requestId });
+    } catch(e) {
+      await pool.query(`UPDATE deposit_intents SET status='failed' WHERE reference=$1`,[reference]);
+      return fail(res,502,'Unable to start deposit with the payment provider — try again.',requestId);
+    }
+  }
+
   // Withdrawal requests never auto-pay out — they just move funds into
   // pending_withdrawal for staff to review (that review UI is a later step).
   // What matters right now: if KYC is required, an unverified user is
@@ -174,58 +337,28 @@ async function handleAuth(req,res,url,requestId,ip) {
   if (req.method==='POST' && url.pathname==='/api/v1/wallet/withdrawal-requests') {
     const amount=Number(data.amount);
     if (!Number.isFinite(amount) || amount<=0) return fail(res,400,'Enter a valid withdrawal amount.',requestId);
-    const kycRequired=await getSetting('kyc_required_for_withdrawal', true);
+    // In live mode this is non-negotiable — never read from platform_settings,
+    // so nobody can disable the KYC gate on a real-money deployment by
+    // flipping a DB row (there isn't even an admin endpoint that writes this
+    // key, but a direct SQL UPDATE against the database would otherwise still
+    // work). The toggle only exists for sandbox/staging convenience.
+    const kycRequired = MODE==='live' ? true : await getSetting('kyc_required_for_withdrawal', true);
     if (kycRequired && user.kyc_status!=='verified') return fail(res,403,'KYC verification is required before you can withdraw.',requestId);
+    // Defense-in-depth alongside the login-time check: a session issued just
+    // before a self-exclusion or cool-off started is still valid for up to 8
+    // hours (see issueSession), so withdrawals need their own check too.
+    const restriction=restrictionFromLimits(await getEffectiveLimits(user.user_id));
+    if (restriction) return fail(res,403,restrictionMessage(restriction),requestId);
     const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId);
+    const withdrawalLimits=await getWithdrawalLimits();
+    const recentActivity=await getRecentWithdrawalActivity(row.id);
+    if (recentActivity.count+1>withdrawalLimits.count) return fail(res,429,`Daily withdrawal request limit reached (${withdrawalLimits.count} per 24 hours). Try again later or contact support.`,requestId);
+    if (recentActivity.total+amount>withdrawalLimits.amount) return fail(res,429,`Daily withdrawal amount limit reached (₦${withdrawalLimits.amount.toLocaleString()} per 24 hours). Try again later or contact support.`,requestId);
     try {
       const result=await wallet.postTransaction(pool,{ walletId:row.id, type:'withdrawal_request', idempotencyKey:data.idempotencyKey||crypto.randomUUID(), referenceType:'withdrawal', entries:[{balanceType:'cash_available',amount:-amount},{balanceType:'pending_withdrawal',amount}] });
       audit(user.user_id,'wallet.withdrawal_requested',ip,{amount});
       return send(res,201,{ wallet:wallet.safeWallet(result.wallet), requestId });
     } catch(e) { return fail(res,400,'Unable to process withdrawal request (insufficient balance).',requestId); }
-  }
-
-  // Starts a deposit with a payment provider and hands back a hosted
-  // checkout URL to redirect the player to — no card details ever touch this
-  // server. The wallet is NOT credited here; that only happens once the
-  // provider confirms the payment succeeded (via webhook, backstopped by the
-  // browser callback redirect) — see creditDeposit() below.
-  if (req.method==='POST' && url.pathname==='/api/v1/wallet/deposits/initialize') {
-    const provider=String(data.provider||'').toLowerCase();
-    if (!['paystack','opay'].includes(provider)) return fail(res,400,'Select a valid payment provider.',requestId);
-    if (!payments.configuredProviders().includes(provider)) return fail(res,503,`${provider} is not configured on this server yet.`,requestId);
-    const amount=Number(data.amount);
-    if (!Number.isFinite(amount) || amount<100) return fail(res,400,'Enter a valid deposit amount (minimum ₦100).',requestId);
-    const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId);
-    const intentId=crypto.randomUUID();
-    await pool.query(
-      `INSERT INTO payment_intents (id,user_id,wallet_id,provider,provider_reference,amount,currency,status)
-       VALUES ($1,$2,$3,$4,$5,$6,'NGN','pending')`,
-      [intentId,user.user_id,row.id,provider,intentId,amount]
-    );
-    const origin=baseUrl(req);
-    try {
-      let init;
-      if (provider==='paystack') {
-        init=await payments.paystackInitialize({
-          amount, reference:intentId,
-          email:user.email || `${String(user.phone_number).replace(/[^\d]/g,'')}@players.winza.local`,
-          callbackUrl:`${origin}/api/v1/payments/callback/paystack?reference=${intentId}`,
-        });
-      } else {
-        init=await payments.opayInitialize({
-          amount, reference:intentId,
-          callbackUrl:`${origin}/api/v1/payments/webhook/opay`,
-          returnUrl:`${origin}/api/v1/payments/callback/opay?reference=${intentId}`,
-          userMobile:user.phone_number,
-        });
-      }
-      audit(user.user_id,'wallet.deposit_initiated',ip,{provider,amount,reference:intentId});
-      return send(res,201,{ redirectUrl:init.redirectUrl, reference:intentId, requestId });
-    } catch(e) {
-      await pool.query(`UPDATE payment_intents SET status='failed', updated_at=now() WHERE id=$1`,[intentId]);
-      console.error(`[${requestId}] ${provider} initialize failed`,e);
-      return fail(res,502,`Unable to start ${provider} payment right now.`,requestId);
-    }
   }
 
   if (req.method==='GET' && url.pathname==='/api/v1/kyc/me') {
@@ -252,88 +385,62 @@ async function handleAuth(req,res,url,requestId,ip) {
     audit(user.user_id,'kyc.submitted',ip);
     return send(res,201,{ message:'Submitted for review.', requestId });
   }
+
+  if (req.method==='GET' && url.pathname==='/api/v1/account/limits') {
+    return send(res,200,{ limits: safeLimits(await getEffectiveLimits(user.user_id)), requestId });
+  }
+  if (req.method==='PUT' && url.pathname==='/api/v1/account/limits/stake') {
+    const raw=data.dailyStakeLimit;
+    const newLimit = raw===null||raw===undefined||raw==='' ? null : Number(raw);
+    if (newLimit!==null && (!Number.isFinite(newLimit) || newLimit<=0)) return fail(res,400,'Enter a valid stake limit, or null to remove it.',requestId);
+    const current=await getEffectiveLimits(user.user_id);
+    const currentLimit = current && current.daily_stake_limit!==null ? Number(current.daily_stake_limit) : null;
+    // Tightening a limit (or setting one for the first time) protects the
+    // player, so it applies immediately. Loosening or removing one is
+    // exactly the kind of impulsive decision these controls exist to slow
+    // down, so it's deferred 24 hours instead.
+    const isLoosening = currentLimit!==null && (newLimit===null || newLimit>currentLimit);
+    if (isLoosening) {
+      await pool.query(`INSERT INTO player_limits (user_id, daily_stake_limit, pending_daily_stake_limit, pending_stake_limit_effective_at, updated_at) VALUES ($1,$2,$3, now() + interval '24 hours', now())
+        ON CONFLICT (user_id) DO UPDATE SET pending_daily_stake_limit=$3, pending_stake_limit_effective_at=now()+interval '24 hours', updated_at=now()`,[user.user_id, currentLimit, newLimit]);
+      audit(user.user_id,'account.stake_limit_change_scheduled',ip,{newLimit});
+      return send(res,200,{ message:'Change scheduled — takes effect in 24 hours.', limits: safeLimits(await getEffectiveLimits(user.user_id)), requestId });
+    }
+    await pool.query(`INSERT INTO player_limits (user_id, daily_stake_limit, pending_daily_stake_limit, pending_stake_limit_effective_at, updated_at) VALUES ($1,$2,NULL,NULL,now())
+      ON CONFLICT (user_id) DO UPDATE SET daily_stake_limit=$2, pending_daily_stake_limit=NULL, pending_stake_limit_effective_at=NULL, updated_at=now()`,[user.user_id,newLimit]);
+    audit(user.user_id,'account.stake_limit_updated',ip,{newLimit});
+    return send(res,200,{ message:'Stake limit updated.', limits: safeLimits(await getEffectiveLimits(user.user_id)), requestId });
+  }
+  if (req.method==='POST' && url.pathname==='/api/v1/account/limits/cool-off') {
+    const hours=Number(data.hours);
+    if (!Number.isFinite(hours) || hours<24 || hours>720) return fail(res,400,'Cool-off must be between 24 and 720 hours.',requestId);
+    const current=await getEffectiveLimits(user.user_id);
+    const proposedUntil=new Date(Date.now()+hours*3600000);
+    // Same no-early-reversal principle as self-exclusion, just for a shorter,
+    // player-chosen window: cool-off can be extended but never shortened
+    // once active.
+    if (current && current.cool_off_until && new Date(current.cool_off_until)>proposedUntil) {
+      return fail(res,400,'An active cool-off cannot be shortened.',requestId);
+    }
+    await pool.query(`INSERT INTO player_limits (user_id, cool_off_until, updated_at) VALUES ($1,$2,now())
+      ON CONFLICT (user_id) DO UPDATE SET cool_off_until=$2, updated_at=now()`,[user.user_id, proposedUntil]);
+    await pool.query('UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL',[user.user_id]);
+    audit(user.user_id,'account.cool_off_started',ip,{hours});
+    return send(res,200,{ message:'Cool-off started. You have been signed out and cannot log back in until it ends.', coolOffUntil:proposedUntil.toISOString(), requestId });
+  }
+  if (req.method==='POST' && url.pathname==='/api/v1/account/limits/self-exclude') {
+    const until=new Date(Date.now()+180*86400000);
+    await pool.query(`INSERT INTO player_limits (user_id, self_excluded_until, updated_at) VALUES ($1,$2,now())
+      ON CONFLICT (user_id) DO UPDATE SET self_excluded_until=$2, updated_at=now()`,[user.user_id, until]);
+    await pool.query('UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL',[user.user_id]);
+    audit(user.user_id,'account.self_exclusion_started',ip);
+    return send(res,200,{ message:'Self-exclusion started. This cannot be undone before it ends.', selfExcludedUntil:until.toISOString(), requestId });
+  }
+
   if (req.method==='POST' && url.pathname==='/api/v1/auth/logout') { await pool.query('UPDATE auth_sessions SET revoked_at=now() WHERE id=$1',[user.id]);audit(user.user_id,'auth.logout',ip);return send(res,204,''); }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/enroll') { const secret=auth.randomBase32(); await pool.query('UPDATE users SET mfa_pending_secret_encrypted=$1 WHERE id=$2',[auth.encrypt(secret),user.user_id]);return send(res,200,{secret,otpauthUrl:`otpauth://totp/WINZA:${encodeURIComponent(user.email)}?secret=${secret}&issuer=WINZA&algorithm=SHA1&digits=6&period=30`,requestId}); }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/confirm') { const {rows}=await pool.query('SELECT mfa_pending_secret_encrypted FROM users WHERE id=$1',[user.user_id]);if(!rows[0]?.mfa_pending_secret_encrypted||!auth.validTotp(auth.decrypt(rows[0].mfa_pending_secret_encrypted),data.code))return fail(res,400,'Invalid authenticator code.',requestId);await pool.query('UPDATE users SET mfa_secret_encrypted=mfa_pending_secret_encrypted,mfa_pending_secret_encrypted=NULL,mfa_enabled_at=now() WHERE id=$1',[user.user_id]);audit(user.user_id,'auth.mfa_enabled',ip);return send(res,200,{message:'MFA enabled.',requestId}); }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/disable') { if(!data.code)return fail(res,400,'Authenticator code is required.',requestId);const {rows}=await pool.query('SELECT mfa_secret_encrypted FROM users WHERE id=$1',[user.user_id]);if(!rows[0]?.mfa_secret_encrypted||!auth.validTotp(auth.decrypt(rows[0].mfa_secret_encrypted),data.code))return fail(res,400,'Invalid authenticator code.',requestId);await pool.query('UPDATE users SET mfa_secret_encrypted=NULL,mfa_enabled_at=NULL WHERE id=$1',[user.user_id]);audit(user.user_id,'auth.mfa_disabled',ip);return send(res,200,{message:'MFA disabled.',requestId}); }
-  return fail(res,404,'Not found',requestId);
-}
-
-// The single choke point where a confirmed provider payment turns into an
-// actual wallet credit. Called from both the webhook (authoritative,
-// server-to-server) and the browser callback redirect (just for snappier
-// UX) — safe to call twice for the same intent because wallet.postTransaction
-// is idempotent on (walletId, idempotencyKey), and this also short-circuits
-// once the intent already shows 'success'.
-async function creditDeposit(intentId, provider) {
-  const { rows }=await pool.query('SELECT * FROM payment_intents WHERE id=$1 AND provider=$2',[intentId,provider]);
-  const intent=rows[0];
-  if (!intent) return { ok:false, reason:'not_found' };
-  if (intent.status==='success') return { ok:true, alreadyPosted:true };
-  const verify = provider==='paystack'
-    ? await payments.paystackVerify(intent.provider_reference)
-    : await payments.opayVerify(intent.provider_reference);
-  if (!verify.success) {
-    await pool.query(`UPDATE payment_intents SET status='failed', updated_at=now() WHERE id=$1 AND status='pending'`,[intentId]);
-    return { ok:false, reason:'not_successful' };
-  }
-  // Trust the provider's confirmed amount over whatever was requested at
-  // initialize time — that's the only number that reflects money actually received.
-  const result=await wallet.postTransaction(pool,{
-    walletId:intent.wallet_id,
-    type:'deposit',
-    idempotencyKey:`${provider}:${intent.provider_reference}`,
-    referenceType:'payment_intent',
-    referenceId:intent.id,
-    entries:[{ balanceType:'cash_available', amount:verify.amount }],
-    metadata:{ provider },
-  });
-  await pool.query(`UPDATE payment_intents SET status='success', updated_at=now() WHERE id=$1`,[intentId]);
-  audit(intent.user_id,'wallet.deposit_confirmed',null,{ provider, amount:verify.amount, reference:intent.provider_reference });
-  return { ok:true, alreadyPosted:result.alreadyPosted };
-}
-
-// Public routes: the browser return redirect (no session — the player's
-// browser is just bouncing back from the provider's hosted page) and the
-// server-to-server webhook (no session either — authenticated purely by its
-// signature). Neither can be folded into handleAuth's session-gated routing.
-async function handlePayments(req,res,url,requestId,ip) {
-  if (!pool) return fail(res,503,'Payments are not configured.',requestId);
-
-  const cbMatch = req.method==='GET' && url.pathname.match(/^\/api\/v1\/payments\/callback\/(paystack|opay)$/);
-  if (cbMatch) {
-    const provider=cbMatch[1];
-    const reference=url.searchParams.get('reference');
-    let outcome='failed';
-    if (reference) {
-      try { const result=await creditDeposit(reference,provider); outcome=result.ok?'success':'failed'; }
-      catch(e) { console.error(`[${requestId}] ${provider} callback error`,e); }
-    }
-    res.writeHead(302,{ Location:`/?deposit=${outcome}`, 'Cache-Control':'no-store' });
-    return res.end();
-  }
-
-  const whMatch = req.method==='POST' && url.pathname.match(/^\/api\/v1\/payments\/webhook\/(paystack|opay)$/);
-  if (whMatch) {
-    const provider=whMatch[1];
-    const raw=await rawBody(req);
-    const signatureHeader = provider==='paystack' ? req.headers['x-paystack-signature'] : req.headers['signature'];
-    const valid = provider==='paystack'
-      ? payments.paystackVerifySignature(raw,signatureHeader)
-      : payments.opayVerifySignature(raw,signatureHeader);
-    if (!valid) { audit(null,'webhook.signature_invalid',ip,{provider}); return fail(res,401,'Invalid signature.',requestId); }
-    let payload; try { payload=JSON.parse(raw); } catch { return fail(res,400,'Invalid payload.',requestId); }
-    const reference = provider==='paystack' ? payload?.data?.reference : (payload?.payload?.reference || payload?.reference);
-    if (reference) {
-      try { await creditDeposit(reference,provider); }
-      catch(e) { console.error(`[${requestId}] ${provider} webhook credit error`,e); }
-    }
-    // Always acknowledge quickly so the provider doesn't retry-storm this
-    // endpoint; a failed credit above is still recoverable from the
-    // 'pending' payment_intents row and reconciled by hand if needed.
-    return send(res,200,{ received:true, requestId });
-  }
-
   return fail(res,404,'Not found',requestId);
 }
 
@@ -377,8 +484,73 @@ async function handleAdmin(req,res,url,requestId,ip) {
     return send(res,200,{ rtp, requestId });
   }
 
-  if (approveMatch || rejectMatch) {
-    const submissionId=(approveMatch||rejectMatch)[1];
+  const WITHDRAWAL_LIMIT_BOUNDS = { minAmount:1000, maxAmount:50000000, minCount:1, maxCount:50 };
+  if (req.method==='GET' && url.pathname==='/api/v1/admin/withdrawal-limits') {
+    return send(res,200,{ limits:await getWithdrawalLimits(), bounds:WITHDRAWAL_LIMIT_BOUNDS, requestId });
+  }
+  // Same risk-control tier as RTP: admin/owner only, bounded so an
+  // over-permissive value (or an empty one) can't disable fraud protection
+  // entirely — there's always SOME daily cap, never "unlimited."
+  if (req.method==='PUT' && url.pathname==='/api/v1/admin/withdrawal-limits') {
+    if (!['admin','owner'].includes(user.role)) return fail(res,403,'Forbidden.',requestId);
+    const data=await body(req);
+    const amount=Number(data.dailyAmountLimit), count=Number(data.dailyCountLimit);
+    if (!Number.isFinite(amount) || amount<WITHDRAWAL_LIMIT_BOUNDS.minAmount || amount>WITHDRAWAL_LIMIT_BOUNDS.maxAmount) {
+      return fail(res,400,`Daily amount limit must be between ₦${WITHDRAWAL_LIMIT_BOUNDS.minAmount.toLocaleString()} and ₦${WITHDRAWAL_LIMIT_BOUNDS.maxAmount.toLocaleString()}.`,requestId);
+    }
+    if (!Number.isInteger(count) || count<WITHDRAWAL_LIMIT_BOUNDS.minCount || count>WITHDRAWAL_LIMIT_BOUNDS.maxCount) {
+      return fail(res,400,`Daily count limit must be a whole number between ${WITHDRAWAL_LIMIT_BOUNDS.minCount} and ${WITHDRAWAL_LIMIT_BOUNDS.maxCount}.`,requestId);
+    }
+    await pool.query('INSERT INTO platform_settings (key,value,updated_at) VALUES ($1,$2,now()) ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=now()',['withdrawal_daily_amount_limit', JSON.stringify(amount)]);
+    await pool.query('INSERT INTO platform_settings (key,value,updated_at) VALUES ($1,$2,now()) ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=now()',['withdrawal_daily_count_limit', JSON.stringify(count)]);
+    audit(user.user_id,'admin.withdrawal_limits_updated',ip,{ amount, count });
+    return send(res,200,{ limits:{ amount, count }, requestId });
+  }
+
+  if (approveMatch) {
+    const submissionId=approveMatch[1];
+    const data=await body(req);
+    // Screen before opening a transaction — an external HTTP call (a real
+    // screening provider) should never happen while holding a FOR UPDATE
+    // row lock. Re-checked for status='pending' again inside the
+    // transaction below to close the race against a second reviewer.
+    const { rows:lookup }=await pool.query(`SELECT * FROM kyc_submissions WHERE id=$1 AND status='pending'`,[submissionId]);
+    const pendingSubmission=lookup[0];
+    if (!pendingSubmission) return fail(res,404,'No pending submission with that id.',requestId);
+
+    let screeningStatus, screeningDetail;
+    try {
+      const result=await sanctions.screen({ fullName:pendingSubmission.full_name, dateOfBirth:pendingSubmission.date_of_birth, idType:pendingSubmission.id_type, idNumber:pendingSubmission.id_number });
+      if (!result.configured) {
+        // Fail safe, not fail open: no provider configured does NOT mean
+        // "treat as clear" — it means a human has to explicitly say so, and
+        // that reason is logged and stored on the submission permanently.
+        const override=String(data.sanctionsScreeningOverrideReason||'').trim();
+        if (override.length<10) return fail(res,400,'No sanctions-screening provider is configured. Approving requires sanctionsScreeningOverrideReason (10+ characters) explicitly acknowledging this was not automatically screened.',requestId);
+        screeningStatus='not_configured_override'; screeningDetail=override.slice(0,500);
+      } else if (result.hit) {
+        audit(user.user_id,'kyc.sanctions_hit_blocked_approval',ip,{submissionId,detail:result.detail});
+        return fail(res,409,'This submission matched a sanctions/PEP screening result and cannot be approved this way. Reject it or escalate for manual review.',requestId);
+      } else {
+        screeningStatus='clear'; screeningDetail=result.detail||null;
+      }
+    } catch(e) { return fail(res,502,'Sanctions screening provider request failed — try again.',requestId); }
+
+    const client=await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows }=await client.query(`SELECT * FROM kyc_submissions WHERE id=$1 AND status='pending' FOR UPDATE`,[submissionId]);
+      const submission=rows[0];
+      if (!submission) { await client.query('ROLLBACK'); return fail(res,404,'No pending submission with that id.',requestId); }
+      await client.query(`UPDATE kyc_submissions SET status='verified', reviewed_by=$1, reviewed_at=now(), sanctions_screening_status=$2, sanctions_screening_detail=$3, sanctions_screened_at=now() WHERE id=$4`,[user.user_id,screeningStatus,screeningDetail,submissionId]);
+      await client.query(`UPDATE users SET kyc_status='verified', kyc_reviewed_by=$1, kyc_reviewed_at=now(), updated_at=now() WHERE id=$2`,[user.user_id,submission.user_id]);
+      await client.query('COMMIT');
+    } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    audit(user.user_id,'kyc.approved',ip,{submissionId,screeningStatus});
+    return send(res,200,{ message:'Approved.', requestId });
+  }
+  if (rejectMatch) {
+    const submissionId=rejectMatch[1];
     const data=await body(req);
     const client=await pool.connect();
     try {
@@ -386,33 +558,173 @@ async function handleAdmin(req,res,url,requestId,ip) {
       const { rows }=await client.query(`SELECT * FROM kyc_submissions WHERE id=$1 AND status='pending' FOR UPDATE`,[submissionId]);
       const submission=rows[0];
       if (!submission) { await client.query('ROLLBACK'); return fail(res,404,'No pending submission with that id.',requestId); }
-      if (approveMatch) {
-        await client.query(`UPDATE kyc_submissions SET status='verified', reviewed_by=$1, reviewed_at=now() WHERE id=$2`,[user.user_id,submissionId]);
-        await client.query(`UPDATE users SET kyc_status='verified', kyc_reviewed_by=$1, kyc_reviewed_at=now(), updated_at=now() WHERE id=$2`,[user.user_id,submission.user_id]);
-      } else {
-        const reason=String(data.reason||'').trim().slice(0,300)||'Not specified';
-        await client.query(`UPDATE kyc_submissions SET status='rejected', reviewed_by=$1, reviewed_at=now(), rejection_reason=$2 WHERE id=$3`,[user.user_id,reason,submissionId]);
-        await client.query(`UPDATE users SET kyc_status='rejected', kyc_reviewed_by=$1, kyc_reviewed_at=now(), updated_at=now() WHERE id=$2`,[user.user_id,submission.user_id]);
-      }
+      const reason=String(data.reason||'').trim().slice(0,300)||'Not specified';
+      await client.query(`UPDATE kyc_submissions SET status='rejected', reviewed_by=$1, reviewed_at=now(), rejection_reason=$2 WHERE id=$3`,[user.user_id,reason,submissionId]);
+      await client.query(`UPDATE users SET kyc_status='rejected', kyc_reviewed_by=$1, kyc_reviewed_at=now(), updated_at=now() WHERE id=$2`,[user.user_id,submission.user_id]);
       await client.query('COMMIT');
     } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
-    audit(user.user_id, approveMatch?'kyc.approved':'kyc.rejected', ip, { submissionId });
-    return send(res,200,{ message: approveMatch?'Approved.':'Rejected.', requestId });
+    audit(user.user_id,'kyc.rejected',ip,{submissionId});
+    return send(res,200,{ message:'Rejected.', requestId });
+  }
+
+  if (req.method==='GET' && url.pathname==='/api/v1/admin/phone-recovery-requests') {
+    const status=url.searchParams.get('status')||'pending';
+    if (!['pending','approved','rejected'].includes(status)) return fail(res,400,'Invalid status filter.',requestId);
+    // Join the latest verified KYC submission on file (if any) so staff can
+    // compare the identity details submitted here against what's already
+    // verified for the account, instead of trusting the request in isolation.
+    const { rows }=await pool.query(`
+      SELECT r.*, u.display_name,
+        k.full_name AS kyc_full_name, k.date_of_birth AS kyc_date_of_birth,
+        k.id_type AS kyc_id_type, k.id_number AS kyc_id_number
+      FROM phone_recovery_requests r
+      JOIN users u ON u.id=r.user_id
+      LEFT JOIN LATERAL (
+        SELECT * FROM kyc_submissions WHERE user_id=r.user_id AND status='verified' ORDER BY created_at DESC LIMIT 1
+      ) k ON true
+      WHERE r.status=$1 ORDER BY r.created_at ASC`,[status]);
+    return send(res,200,{ requests: rows.map(r=>({
+      id:r.id, userId:r.user_id, displayName:r.display_name,
+      oldPhoneNumber:r.old_phone_number, newPhoneNumber:r.new_phone_number,
+      fullName:r.full_name, dateOfBirth:r.date_of_birth, idType:r.id_type, idNumber:r.id_number,
+      reason:r.reason, status:r.status, submittedAt:r.created_at, reviewedAt:r.reviewed_at, rejectionReason:r.rejection_reason,
+      kycOnFile: r.kyc_full_name ? { fullName:r.kyc_full_name, dateOfBirth:r.kyc_date_of_birth, idType:r.kyc_id_type, idNumber:r.kyc_id_number } : null,
+    })), requestId });
+  }
+
+  const recoveryApproveMatch = req.method==='POST' && url.pathname.match(/^\/api\/v1\/admin\/phone-recovery-requests\/([0-9a-f-]{36})\/approve$/);
+  const recoveryRejectMatch  = req.method==='POST' && url.pathname.match(/^\/api\/v1\/admin\/phone-recovery-requests\/([0-9a-f-]{36})\/reject$/);
+  if (recoveryApproveMatch || recoveryRejectMatch) {
+    const reqId=(recoveryApproveMatch||recoveryRejectMatch)[1];
+    const data=await body(req);
+    const client=await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows }=await client.query(`SELECT * FROM phone_recovery_requests WHERE id=$1 AND status='pending' FOR UPDATE`,[reqId]);
+      const reqRow=rows[0];
+      if (!reqRow) { await client.query('ROLLBACK'); return fail(res,404,'No pending request with that id.',requestId); }
+      if (recoveryApproveMatch) {
+        await client.query('UPDATE users SET phone_number=$1, updated_at=now() WHERE id=$2',[reqRow.new_phone_number,reqRow.user_id]);
+        await client.query(`UPDATE phone_recovery_requests SET status='approved', reviewed_by=$1, reviewed_at=now() WHERE id=$2`,[user.user_id,reqId]);
+        // A session tied to the old identity shouldn't silently carry over a
+        // phone-number change — force a fresh OTP login on the new number.
+        await client.query('UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL',[reqRow.user_id]);
+      } else {
+        const reason=String(data.reason||'').trim().slice(0,300)||'Not specified';
+        await client.query(`UPDATE phone_recovery_requests SET status='rejected', reviewed_by=$1, reviewed_at=now(), rejection_reason=$2 WHERE id=$3`,[user.user_id,reason,reqId]);
+      }
+      await client.query('COMMIT');
+    } catch(e) {
+      await client.query('ROLLBACK');
+      // The new number could have been claimed by another account between
+      // request and review — surface that plainly rather than a 500.
+      if (e.code==='23505') return fail(res,409,'That number was registered to another account in the meantime.',requestId);
+      throw e;
+    } finally { client.release(); }
+    audit(user.user_id, recoveryApproveMatch?'phone_recovery.approved':'phone_recovery.rejected', ip, { recoveryRequestId:reqId });
+    return send(res,200,{ message: recoveryApproveMatch?'Approved. The account now signs in with the new number.':'Rejected.', requestId });
   }
 
   return fail(res,404,'Not found',requestId);
 }
 
 const server = http.createServer(async (req,res) => {
-  const url=new URL(req.url,`http://${req.headers.host||'localhost'}`), requestId=crypto.randomUUID(), ip=req.socket.remoteAddress;
+  // clientIp() specifically exists to resolve to the real caller behind a
+  // reverse proxy (Render, or any other PaaS) via X-Forwarded-For — using
+  // the raw socket address here instead made every request behind such a
+  // proxy look like it came from the same address, silently defeating both
+  // the per-IP throttle and the audit log's IP tracking.
+  const url=new URL(req.url,`http://${req.headers.host||'localhost'}`), requestId=crypto.randomUUID(), ip=clientIp(req);
   res.setHeader('X-Request-Id',requestId);
   try {
     if(req.method==='GET'&&url.pathname==='/healthz')return send(res,200,{ok:true,mode:MODE,databaseConfigured:Boolean(pool),requestId});
-    if(req.method==='GET'&&url.pathname==='/api/v1/public/config'){const rtp=await getGameRtp();return send(res,200,{mode:MODE,realMoneyEnabled:false,rtp,rtpMin:rtpConfig.RTP_MIN,rtpMax:rtpConfig.RTP_MAX,depositProviders:payments.configuredProviders(),message:'Payments and real-money play are disabled until licensed production services are configured.',requestId});}
+    if(req.method==='GET'&&url.pathname==='/api/v1/public/config'){
+      const rtp=await getGameRtp();
+      // Mirrors the deposits/initiate gate exactly (WINZA_MODE=live AND that
+      // provider's own credentials set) so the client only ever sees a
+      // provider offered when calling it would actually work.
+      const depositProviders = MODE==='live' ? [
+        ...(process.env.PAYSTACK_SECRET_KEY ? ['paystack'] : []),
+        ...(process.env.OPAY_MERCHANT_ID && process.env.OPAY_PUBLIC_KEY && process.env.OPAY_SECRET_KEY ? ['opay'] : []),
+      ] : [];
+      return send(res,200,{mode:MODE,realMoneyEnabled:false,rtp,rtpMin:rtpConfig.RTP_MIN,rtpMax:rtpConfig.RTP_MAX,depositProviders,message:'Payments and real-money play are disabled until licensed production services are configured.',requestId});
+    }
     if(req.method==='GET'&&url.pathname==='/rtp-config.js')return fs.readFile(path.join(root,'rtp-config.js'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'application/javascript; charset=utf-8'));
-    if(url.pathname.startsWith('/api/v1/payments/'))return await handlePayments(req,res,url,requestId,ip);
+
+    // Unauthenticated by design — the provider calls these, not a signed-in
+    // player — so the raw body's signature is the only thing that proves a
+    // request actually came from that provider. No credentials configured
+    // for that provider means 404 rather than a more specific error,
+    // matching how the rest of this codebase never confirms whether an
+    // unauthenticated feature is configured (see the OTP/password-reset
+    // request handlers). Both webhooks share the same shape: verify
+    // signature over the raw body, ignore anything that isn't a successful
+    // payment, look up the deposit_intents row by reference, verify the
+    // amount actually paid matches what was initiated, then credit the
+    // wallet exactly once via the idempotent wallet.postTransaction().
+    if(req.method==='POST'&&url.pathname==='/api/v1/webhooks/paystack'){
+      if(!process.env.PAYSTACK_SECRET_KEY||!pool) return fail(res,404,'Not found',requestId);
+      const raw=await rawBody(req);
+      if(!paystackLib.verifySignature(raw,req.headers['x-paystack-signature'])){
+        audit(null,'webhook.paystack_signature_invalid',ip);
+        return fail(res,401,'Invalid signature.',requestId);
+      }
+      let payload; try{payload=JSON.parse(raw);}catch{return fail(res,400,'Invalid JSON.',requestId);}
+      // Paystack sends many event types on this same webhook — anything
+      // that isn't a successful charge is acknowledged and ignored, not an
+      // error, so Paystack doesn't keep retrying it.
+      if(payload.event!=='charge.success') return send(res,200,{received:true,requestId});
+      const reference=String(payload.data?.reference||'');
+      const amountKobo=Number(payload.data?.amount);
+      const { rows }=await pool.query(`SELECT * FROM deposit_intents WHERE reference=$1 AND status='pending'`,[reference]);
+      const intent=rows[0];
+      // Unknown reference, or one already completed by an earlier delivery
+      // of this same webhook (Paystack retries) — ack without acting, which
+      // is what makes this idempotent rather than double-crediting a wallet.
+      if(!intent) return send(res,200,{received:true,requestId});
+      const expectedKobo=Math.round(Number(intent.amount)*100);
+      if(amountKobo!==expectedKobo){
+        audit(intent.user_id,'webhook.paystack_amount_mismatch',ip,{reference,expectedKobo,amountKobo});
+        return send(res,200,{received:true,requestId});
+      }
+      await wallet.postTransaction(pool,{ walletId:intent.wallet_id, type:'deposit', idempotencyKey:reference, referenceType:'paystack', referenceId:reference, entries:[{balanceType:'cash_available',amount:Number(intent.amount)}] });
+      await pool.query(`UPDATE deposit_intents SET status='completed', completed_at=now() WHERE reference=$1`,[reference]);
+      audit(intent.user_id,'wallet.deposit_completed',ip,{reference,amount:intent.amount});
+      return send(res,200,{received:true,requestId});
+    }
+
+    if(req.method==='POST'&&url.pathname==='/api/v1/webhooks/opay'){
+      if(!process.env.OPAY_MERCHANT_ID||!process.env.OPAY_PUBLIC_KEY||!process.env.OPAY_SECRET_KEY||!pool) return fail(res,404,'Not found',requestId);
+      const raw=await rawBody(req);
+      if(!opayLib.verifySignature(raw,req.headers['signature'])){
+        audit(null,'webhook.opay_signature_invalid',ip);
+        return fail(res,401,'Invalid signature.',requestId);
+      }
+      let payload; try{payload=JSON.parse(raw);}catch{return fail(res,400,'Invalid JSON.',requestId);}
+      // OPay's Cashier webhook nests the actual event under `payload` in some
+      // documented examples and sends it flat in others — this environment
+      // couldn't confirm which against OPay's own docs site (see the caveat
+      // in opay.js), so both shapes are accepted here.
+      const eventData = payload.payload || payload;
+      if(String(eventData.status||'').toUpperCase()!=='SUCCESS') return send(res,200,{received:true,requestId});
+      const reference=String(eventData.reference||'');
+      const amountKobo=Number(eventData.amount?.total ?? eventData.amount);
+      const { rows }=await pool.query(`SELECT * FROM deposit_intents WHERE reference=$1 AND status='pending'`,[reference]);
+      const intent=rows[0];
+      if(!intent) return send(res,200,{received:true,requestId});
+      const expectedKobo=Math.round(Number(intent.amount)*100);
+      if(amountKobo!==expectedKobo){
+        audit(intent.user_id,'webhook.opay_amount_mismatch',ip,{reference,expectedKobo,amountKobo});
+        return send(res,200,{received:true,requestId});
+      }
+      await wallet.postTransaction(pool,{ walletId:intent.wallet_id, type:'deposit', idempotencyKey:reference, referenceType:'opay', referenceId:reference, entries:[{balanceType:'cash_available',amount:Number(intent.amount)}] });
+      await pool.query(`UPDATE deposit_intents SET status='completed', completed_at=now() WHERE reference=$1`,[reference]);
+      audit(intent.user_id,'wallet.deposit_completed',ip,{reference,amount:intent.amount,provider:'opay'});
+      return send(res,200,{received:true,requestId});
+    }
+
     if(url.pathname.startsWith('/api/v1/admin/'))return await handleAdmin(req,res,url,requestId,ip);
-    if(url.pathname.startsWith('/api/v1/auth/')||url.pathname.startsWith('/api/v1/wallet/')||url.pathname.startsWith('/api/v1/kyc/'))return await handleAuth(req,res,url,requestId,ip);
+    if(url.pathname.startsWith('/api/v1/auth/')||url.pathname.startsWith('/api/v1/wallet/')||url.pathname.startsWith('/api/v1/kyc/')||url.pathname.startsWith('/api/v1/account/'))return await handleAuth(req,res,url,requestId,ip);
     if(req.method==='GET'&&(url.pathname==='/'||url.pathname==='/winza.html'))return fs.readFile(path.join(root,'winza.html'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));
     if(req.method==='GET'&&(url.pathname==='/admin'||url.pathname==='/admin.html'))return fs.readFile(path.join(root,'admin.html'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));
     return fail(res,404,'Not found',requestId);

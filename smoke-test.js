@@ -9,6 +9,9 @@
 // To also test the admin approval step, provide a staff account created with
 // create-staff-account.js (role must be risk, admin, or owner):
 //   STAFF_EMAIL=you@example.com STAFF_PASSWORD=... node smoke-test.js https://your-app.onrender.com
+//
+// The OTP steps below need the target server to have OTP_DEV_ECHO=true set
+// (dev/staging only — never on a deployment real users can reach).
 
 const BASE_URL = (process.argv[2] || process.env.WINZA_BASE_URL || '').replace(/\/$/, '');
 if (!BASE_URL) {
@@ -57,7 +60,7 @@ async function main() {
   record('POST /api/v1/auth/otp/request', res.status === 202, JSON.stringify(data));
   if (res.status !== 202) return finish();
   if (!data.devCode) {
-    record('devCode present (no SMS provider configured)', false, 'Set WINZA_MODE to non-live and leave OTP_SMS_WEBHOOK_URL unset to test this way, or supply the code manually.');
+    record('devCode present (no SMS provider configured)', false, 'Set OTP_DEV_ECHO=true (and leave OTP_SMS_WEBHOOK_URL unset, WINZA_MODE non-live) on the target server to test this way, or supply the code manually.');
     return finish();
   }
 
@@ -68,6 +71,7 @@ async function main() {
   });
   data = await json(res);
   const token = data.accessToken;
+  const originalUserId = data.user?.id;
   record('POST /api/v1/auth/otp/verify', res.ok && Boolean(token) && data.isNewAccount === true, token ? 'token received, new account' : JSON.stringify(data));
   if (!token) return finish();
 
@@ -95,20 +99,62 @@ async function main() {
   const startsAtZero = Number(w.cashAvailable) === 0 && Number(w.bonusAvailable) === 0;
   record('GET /api/v1/wallet/me', res.ok && startsAtZero, JSON.stringify(w));
 
-  // 7b. Deposit-initialize rejects an unconfigured/unknown provider (400/503
-  // either way — never silently accepted), and rejects a below-minimum amount.
-  res = await fetch(`${BASE_URL}/api/v1/wallet/deposits/initialize`, {
+  // 7b. Deposit-initiate: an unrecognized provider is always rejected (400)
+  // regardless of mode/config, and a valid provider stays gated behind
+  // WINZA_MODE=live + that provider's own credentials — on the typical
+  // sandbox smoke-test target this is expected to still come back 403.
+  res = await fetch(`${BASE_URL}/api/v1/wallet/deposits/initiate`, {
     method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ provider: 'not-a-real-provider', amount: 500 }),
   });
-  record('deposit-initialize rejects unknown provider (400)', res.status === 400, JSON.stringify(await json(res)));
+  record('deposit-initiate rejects unknown provider (400)', res.status === 400, JSON.stringify(await json(res)));
 
-  res = await fetch(`${BASE_URL}/api/v1/wallet/deposits/initialize`, {
+  res = await fetch(`${BASE_URL}/api/v1/wallet/deposits/initiate`, {
     method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ provider: 'paystack', amount: 1 }),
+    body: JSON.stringify({ provider: 'opay', amount: 500 }),
   });
   data = await json(res);
-  record('deposit-initialize rejects amount below ₦100', res.status === 400 || (res.status === 503 && data.error), JSON.stringify(data));
+  record('deposit-initiate stays gated in non-live/unconfigured mode (403)', res.status === 403, JSON.stringify(data));
+
+  // Responsible-gambling limits: server-enforced stake-limit scheduling and
+  // self-exclusion blocking login. Uses its own throwaway account since
+  // self-exclusion can't be undone — reusing `token`/`phone` here would
+  // permanently lock the account used by every step below this one.
+  {
+    const { raw: rgPhone } = randomPhone();
+    res = await fetch(`${BASE_URL}/api/v1/auth/otp/request`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: rgPhone }) });
+    data = await json(res);
+    if (data.devCode) {
+      res = await fetch(`${BASE_URL}/api/v1/auth/otp/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: rgPhone, code: data.devCode }) });
+      data = await json(res);
+      const rgToken = data.accessToken;
+      if (rgToken) {
+        res = await fetch(`${BASE_URL}/api/v1/account/limits/stake`, { method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${rgToken}` }, body: JSON.stringify({ dailyStakeLimit: 1000 }) });
+        data = await json(res);
+        record('PUT stake limit (first time, applies immediately)', res.ok && data.limits?.dailyStakeLimit === 1000, JSON.stringify(data));
+
+        res = await fetch(`${BASE_URL}/api/v1/account/limits/stake`, { method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${rgToken}` }, body: JSON.stringify({ dailyStakeLimit: 5000 }) });
+        data = await json(res);
+        record('loosening a stake limit is scheduled, not immediate', res.ok && data.limits?.dailyStakeLimit === 1000 && data.limits?.pendingDailyStakeLimit === 5000, JSON.stringify(data));
+
+        res = await fetch(`${BASE_URL}/api/v1/account/limits/self-exclude`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${rgToken}` }, body: '{}' });
+        record('POST /api/v1/account/limits/self-exclude', res.ok);
+
+        res = await fetch(`${BASE_URL}/api/v1/auth/me`, { headers: { Authorization: `Bearer ${rgToken}` } });
+        record('session revoked immediately after self-exclusion', res.status === 401);
+
+        res = await fetch(`${BASE_URL}/api/v1/auth/otp/request`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: rgPhone }) });
+        data = await json(res);
+        if (data.devCode) {
+          res = await fetch(`${BASE_URL}/api/v1/auth/otp/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: rgPhone, code: data.devCode }) });
+          data = await json(res);
+          record('login blocked after self-exclusion (403)', res.status === 403 && /self-exclusion/i.test(data.error || ''), JSON.stringify(data));
+        }
+      }
+    } else {
+      console.log('(skipping responsible-gambling checks — needs OTP_DEV_ECHO=true on the target server)');
+    }
+  }
 
   // 8. Withdrawal is blocked before KYC (assuming the default setting is on).
   res = await fetch(`${BASE_URL}/api/v1/wallet/withdrawal-requests`, {
@@ -146,8 +192,22 @@ async function main() {
       const submission = (data.submissions || []).find(s => s.phoneNumber?.endsWith(suffix));
       record('admin sees the pending submission', Boolean(submission));
       if (submission) {
+        // No SANCTIONS_SCREENING_WEBHOOK_URL is assumed configured on a
+        // typical test/staging server, so approving with no override reason
+        // should be refused — the fail-safe (not fail-open) behavior is
+        // exactly what's under test here, not a provider integration.
         res = await fetch(`${BASE_URL}/api/v1/admin/kyc/submissions/${submission.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` }, body: '{}' });
-        record('admin approves the submission', res.ok);
+        data = await json(res);
+        const noProviderConfigured = res.status === 400 && /sanctionsScreeningOverrideReason/i.test(data.error || '');
+        if (noProviderConfigured) {
+          record('approval without screening requires an override reason (400)', true);
+          res = await fetch(`${BASE_URL}/api/v1/admin/kyc/submissions/${submission.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` }, body: JSON.stringify({ sanctionsScreeningOverrideReason: 'Smoke test — no provider configured on this deployment.' }) });
+          record('admin approves the submission with an override reason', res.ok, JSON.stringify(await json(res)));
+        } else {
+          // A real screening provider is configured on this deployment — the
+          // first call above should have succeeded outright (assuming a clear result).
+          record('admin approves the submission', res.ok, JSON.stringify(data));
+        }
 
         res = await fetch(`${BASE_URL}/api/v1/kyc/me`, { headers: { Authorization: `Bearer ${token}` } });
         data = await json(res);
@@ -167,6 +227,36 @@ async function main() {
       });
       data = await json(res);
       record('RTP set to 96% accepted', res.ok && data.rtp === 0.96, JSON.stringify(data));
+
+      // Withdrawal velocity limits: bounds are enforced on the admin write,
+      // and a lowered limit blocks a withdrawal request before it ever
+      // reaches the balance check — the wallet stays at ₦0 in sandbox (no
+      // payment processor to fund it), so this is the only way to exercise
+      // the block without a real deposit.
+      res = await fetch(`${BASE_URL}/api/v1/admin/withdrawal-limits`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` },
+        body: JSON.stringify({ dailyAmountLimit: 1, dailyCountLimit: 5 }),
+      });
+      record('withdrawal amount limit below bounds rejected (400)', res.status === 400);
+
+      res = await fetch(`${BASE_URL}/api/v1/admin/withdrawal-limits`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` },
+        body: JSON.stringify({ dailyAmountLimit: 1000, dailyCountLimit: 5 }),
+      });
+      record('withdrawal amount limit set to ₦1,000', res.ok);
+
+      res = await fetch(`${BASE_URL}/api/v1/wallet/withdrawal-requests`, {
+        method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ amount: 5000 }),
+      });
+      data = await json(res);
+      record('withdrawal above the daily amount limit is blocked (429)', res.status === 429 && /amount limit/i.test(data.error || ''), JSON.stringify(data));
+
+      res = await fetch(`${BASE_URL}/api/v1/admin/withdrawal-limits`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` },
+        body: JSON.stringify({ dailyAmountLimit: 500000, dailyCountLimit: 5 }),
+      });
+      record('withdrawal limits restored to defaults', res.ok);
     }
   } else {
     console.log('(skipping admin-approval checks — set STAFF_EMAIL/STAFF_PASSWORD to include them)');
@@ -178,6 +268,51 @@ async function main() {
 
   res = await fetch(`${BASE_URL}/api/v1/auth/me`, { headers: { Authorization: `Bearer ${token}` } });
   record('token rejected after logout', res.status === 401);
+
+  // 13. Optional: phone recovery flow end-to-end (needs staff credentials,
+  // same as step 11). Run last since approval revokes the account's sessions
+  // and changes which phone number logs into it — reusing `token` afterward
+  // would no longer prove anything.
+  if (process.env.STAFF_EMAIL && process.env.STAFF_PASSWORD) {
+    res = await fetch(`${BASE_URL}/api/v1/auth/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: process.env.STAFF_EMAIL, password: process.env.STAFF_PASSWORD }),
+    });
+    data = await json(res);
+    const staffToken = data.accessToken;
+    if (staffToken) {
+      const { raw: newPhoneRaw } = randomPhone();
+      res = await fetch(`${BASE_URL}/api/v1/auth/recovery/phone-change-request`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ oldPhone: phone, newPhone: newPhoneRaw, fullName: 'Smoke Test', dateOfBirth: '1995-01-01', idType: 'nin', idNumber: '12345678901', reason: 'Lost phone' }),
+      });
+      record('POST /api/v1/auth/recovery/phone-change-request', res.status === 202);
+
+      res = await fetch(`${BASE_URL}/api/v1/admin/phone-recovery-requests?status=pending`, { headers: { Authorization: `Bearer ${staffToken}` } });
+      data = await json(res);
+      const recoveryReq = (data.requests || []).find(r => r.oldPhoneNumber?.endsWith(suffix));
+      record('admin sees the pending phone recovery request', Boolean(recoveryReq));
+      if (recoveryReq) {
+        record('KYC-on-file comparison present', Boolean(recoveryReq.kycOnFile));
+        res = await fetch(`${BASE_URL}/api/v1/admin/phone-recovery-requests/${recoveryReq.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${staffToken}` }, body: '{}' });
+        record('admin approves the phone recovery request', res.ok);
+
+        // Confirm the new number now logs into the *same* account rather
+        // than registering a fresh one.
+        res = await fetch(`${BASE_URL}/api/v1/auth/otp/request`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: newPhoneRaw }) });
+        data = await json(res);
+        if (data.devCode) {
+          res = await fetch(`${BASE_URL}/api/v1/auth/otp/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone: newPhoneRaw, code: data.devCode }) });
+          data = await json(res);
+          record('new number logs into the same account after approval', res.ok && data.user?.id === originalUserId && data.isNewAccount === false, JSON.stringify(data.user));
+        } else {
+          console.log('(skipping post-approval login check — needs OTP_DEV_ECHO=true on the target server)');
+        }
+      }
+    }
+  } else {
+    console.log('(skipping phone recovery checks — set STAFF_EMAIL/STAFF_PASSWORD to include them)');
+  }
 
   finish();
 }
