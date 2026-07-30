@@ -2,8 +2,8 @@
 
 This repository now has a safe deployment boundary and account-security API for the existing front-end.
 It starts in `sandbox` mode and intentionally rejects the idea that browser
-balances are real funds. KYC and withdrawal-request scaffolding exist, but there is
-still no live payment processor, wagering, or actual payout system yet.
+balances are real funds. KYC, withdrawal-request scaffolding, and deposits via
+Paystack/OPay exist, but there is still no wagering or actual payout system yet.
 Authentication requires PostgreSQL and environment secrets before it can run.
 
 ## Run locally
@@ -11,8 +11,9 @@ Authentication requires PostgreSQL and environment secrets before it can run.
 1. Install Node.js 20 or newer.
 2. Run `npm install` to install the PostgreSQL driver.
 3. Apply `schema.sql` to a managed PostgreSQL database (fresh install). If you already
-   applied an earlier version of `schema.sql`, run `migration_002_phone_kyc.sql` instead —
-   it only adds columns/tables, safe to run against an existing database.
+   applied an earlier version of `schema.sql`, run `migration_002_phone_kyc.sql` and
+   `migration_004_payments.sql` instead — they only add columns/tables, safe to run
+   against an existing database.
 4. Copy `.env.example` values into your deployment secret manager and generate distinct `JWT_SECRET` and `MFA_ENCRYPTION_KEY` values.
 5. Run `npm start`.
 6. Open `http://127.0.0.1:3000`.
@@ -57,6 +58,40 @@ A wallet row is still created automatically, in the same transaction as the user
 row, for every new account. There is still no route that lets anyone adjust a
 balance directly — money only moves through `wallet.postTransaction()`, following
 the same idempotency-key/row-locking/append-only-ledger guarantees as before.
+
+## Deposits (Paystack / OPay)
+
+- `POST /api/v1/wallet/deposits/initialize` — `{ provider: "paystack"|"opay", amount }`.
+  Creates a `payment_intents` row, calls the provider's own API, and returns
+  `{ redirectUrl, reference }`. The client navigates the player's full browser
+  to `redirectUrl` — the provider's own hosted payment page — so card details
+  never touch this server and no CSP/script changes were needed.
+- A provider only shows up in this flow (and in `depositProviders` on
+  `GET /api/v1/public/config`) once its env vars are set — see `.env.example`.
+  With neither set, deposits behave exactly as before (disabled, with the
+  existing "Deposits not configured" message).
+- **The wallet is only ever credited once the provider confirms success**,
+  via two paths that both funnel into the same idempotent `creditDeposit()`:
+  - `POST /api/v1/payments/webhook/{paystack,opay}` — the authoritative path.
+    Verifies the request signature (`x-paystack-signature` HMAC-SHA512 for
+    Paystack; `Signature` header for OPay) before trusting anything in the body.
+  - `GET /api/v1/payments/callback/{paystack,opay}` — the browser redirect back
+    from the provider after payment; re-verifies the transaction against the
+    provider's API (never trusts the query string alone) and is purely a UX
+    backstop in case the webhook is delayed.
+  - Both paths key off `wallet.postTransaction()`'s existing idempotency
+    guarantee (`{provider}:{providerReference}`), so a webhook and a callback
+    racing each other — or a provider retrying a webhook — can never double-credit.
+- Paystack is implemented against its stable, well-documented Transaction API
+  (`/transaction/initialize`, `/transaction/verify/:reference`) and should work
+  as-is with `sk_test_...`/`sk_live_...` keys from the Paystack dashboard.
+- OPay is implemented against its publicly documented Cashier API shape, but
+  this environment couldn't reach OPay's docs site to verify field names
+  line-by-line — treat it as best-effort plumbing. Once you have OPay merchant
+  dashboard access, double-check the endpoint path, request/response fields,
+  and signature scheme in `payments.js` (`opayInitialize`/`opayVerify`/`opaySign`)
+  against what's actually issued to your merchant account before relying on it
+  for real payments.
 
 ## KYC
 

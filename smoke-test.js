@@ -45,6 +45,7 @@ async function main() {
   data = await json(res);
   record('GET /api/v1/public/config', res.ok && data.realMoneyEnabled === false, JSON.stringify(data));
   record('public RTP is within 90-100%', typeof data.rtp === 'number' && data.rtp >= 0.90 && data.rtp <= 1.00, `rtp=${data.rtp}`);
+  record('public config reports deposit providers', Array.isArray(data.depositProviders), JSON.stringify(data.depositProviders));
 
   // 3. Request an OTP for a fresh phone number.
   const { raw: phone, suffix } = randomPhone();
@@ -93,6 +94,21 @@ async function main() {
   const w = data.wallet || {};
   const startsAtZero = Number(w.cashAvailable) === 0 && Number(w.bonusAvailable) === 0;
   record('GET /api/v1/wallet/me', res.ok && startsAtZero, JSON.stringify(w));
+
+  // 7b. Deposit-initialize rejects an unconfigured/unknown provider (400/503
+  // either way — never silently accepted), and rejects a below-minimum amount.
+  res = await fetch(`${BASE_URL}/api/v1/wallet/deposits/initialize`, {
+    method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ provider: 'not-a-real-provider', amount: 500 }),
+  });
+  record('deposit-initialize rejects unknown provider (400)', res.status === 400, JSON.stringify(await json(res)));
+
+  res = await fetch(`${BASE_URL}/api/v1/wallet/deposits/initialize`, {
+    method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ provider: 'paystack', amount: 1 }),
+  });
+  data = await json(res);
+  record('deposit-initialize rejects amount below ₦100', res.status === 400 || (res.status === 503 && data.error), JSON.stringify(data));
 
   // 8. Withdrawal is blocked before KYC (assuming the default setting is on).
   res = await fetch(`${BASE_URL}/api/v1/wallet/withdrawal-requests`, {

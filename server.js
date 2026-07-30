@@ -7,6 +7,7 @@ const auth = require('./auth');
 const wallet = require('./wallet');
 const otpLib = require('./otp');
 const rtpConfig = require('./rtp-config');
+const payments = require('./payments');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -39,6 +40,14 @@ function throttled(ip) { const now=Date.now(), record=attempts.get(ip)||{count:0
 // when there's no proxy in front (e.g. running locally).
 function clientIp(req) { const forwarded=req.headers['x-forwarded-for']; if (forwarded) return String(forwarded).split(',')[0].trim(); return req.socket.remoteAddress; }
 async function body(req) { return new Promise((resolve,reject)=>{let raw='';req.on('data',c=>{raw+=c;if(raw.length>16_384)req.destroy();});req.on('end',()=>{try{resolve(raw?JSON.parse(raw):{});}catch{reject(new Error('Invalid JSON body'));}});req.on('error',reject);}); }
+// Payment webhooks must be verified against the exact bytes the provider
+// signed — parsing to JSON first and re-stringifying can reorder keys or
+// change whitespace and silently break signature verification.
+async function rawBody(req) { return new Promise((resolve,reject)=>{let raw='';req.on('data',c=>{raw+=c;if(raw.length>65_536)req.destroy();});req.on('end',()=>resolve(raw));req.on('error',reject);}); }
+// Absolute origin used to build provider callback/webhook URLs. Prefer an
+// explicit APP_BASE_URL (needed behind most proxies/CDNs) and fall back to
+// the request's own Host header for local/simple deployments.
+function baseUrl(req) { if (process.env.APP_BASE_URL) return process.env.APP_BASE_URL.replace(/\/$/,''); const proto=req.headers['x-forwarded-proto']||'http'; return `${proto}://${req.headers.host}`; }
 function ready(res, requestId) { if (!pool || !JWT_SECRET || JWT_SECRET.length < 32) { fail(res,503,'Authentication service is not configured.',requestId); return false; } return true; }
 async function sessionFrom(req) { const token=(req.headers.authorization||'').replace(/^Bearer\s+/i,''); const payload=auth.verify(token,JWT_SECRET); const { rows }=await pool.query('SELECT s.id,u.id AS user_id,u.email,u.phone_number,u.display_name,u.role,u.is_active,u.kyc_status FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND s.expires_at>now() AND s.revoked_at IS NULL',[payload.sid]); if(!rows[0]||!rows[0].is_active)throw new Error('Unauthorized'); return rows[0]; }
 function issueSession(user) { const sid=crypto.randomUUID(), expires=new Date(Date.now()+8*60*60_000); return pool.query('INSERT INTO auth_sessions (id,user_id,expires_at) VALUES ($1,$2,$3)',[sid,user.id,expires]).then(()=>({accessToken:auth.sign({sub:user.id,sid,role:user.role},JWT_SECRET,8*60*60),expiresAt:expires.toISOString()})); }
@@ -175,6 +184,50 @@ async function handleAuth(req,res,url,requestId,ip) {
     } catch(e) { return fail(res,400,'Unable to process withdrawal request (insufficient balance).',requestId); }
   }
 
+  // Starts a deposit with a payment provider and hands back a hosted
+  // checkout URL to redirect the player to — no card details ever touch this
+  // server. The wallet is NOT credited here; that only happens once the
+  // provider confirms the payment succeeded (via webhook, backstopped by the
+  // browser callback redirect) — see creditDeposit() below.
+  if (req.method==='POST' && url.pathname==='/api/v1/wallet/deposits/initialize') {
+    const provider=String(data.provider||'').toLowerCase();
+    if (!['paystack','opay'].includes(provider)) return fail(res,400,'Select a valid payment provider.',requestId);
+    if (!payments.configuredProviders().includes(provider)) return fail(res,503,`${provider} is not configured on this server yet.`,requestId);
+    const amount=Number(data.amount);
+    if (!Number.isFinite(amount) || amount<100) return fail(res,400,'Enter a valid deposit amount (minimum ₦100).',requestId);
+    const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId);
+    const intentId=crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO payment_intents (id,user_id,wallet_id,provider,provider_reference,amount,currency,status)
+       VALUES ($1,$2,$3,$4,$5,$6,'NGN','pending')`,
+      [intentId,user.user_id,row.id,provider,intentId,amount]
+    );
+    const origin=baseUrl(req);
+    try {
+      let init;
+      if (provider==='paystack') {
+        init=await payments.paystackInitialize({
+          amount, reference:intentId,
+          email:user.email || `${String(user.phone_number).replace(/[^\d]/g,'')}@players.winza.local`,
+          callbackUrl:`${origin}/api/v1/payments/callback/paystack?reference=${intentId}`,
+        });
+      } else {
+        init=await payments.opayInitialize({
+          amount, reference:intentId,
+          callbackUrl:`${origin}/api/v1/payments/webhook/opay`,
+          returnUrl:`${origin}/api/v1/payments/callback/opay?reference=${intentId}`,
+          userMobile:user.phone_number,
+        });
+      }
+      audit(user.user_id,'wallet.deposit_initiated',ip,{provider,amount,reference:intentId});
+      return send(res,201,{ redirectUrl:init.redirectUrl, reference:intentId, requestId });
+    } catch(e) {
+      await pool.query(`UPDATE payment_intents SET status='failed', updated_at=now() WHERE id=$1`,[intentId]);
+      console.error(`[${requestId}] ${provider} initialize failed`,e);
+      return fail(res,502,`Unable to start ${provider} payment right now.`,requestId);
+    }
+  }
+
   if (req.method==='GET' && url.pathname==='/api/v1/kyc/me') {
     const { rows }=await pool.query('SELECT * FROM kyc_submissions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1',[user.user_id]);
     return send(res,200,{ kycStatus:user.kyc_status, latestSubmission:rows[0]?safeSubmission(rows[0]):null, requestId });
@@ -203,6 +256,84 @@ async function handleAuth(req,res,url,requestId,ip) {
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/enroll') { const secret=auth.randomBase32(); await pool.query('UPDATE users SET mfa_pending_secret_encrypted=$1 WHERE id=$2',[auth.encrypt(secret),user.user_id]);return send(res,200,{secret,otpauthUrl:`otpauth://totp/WINZA:${encodeURIComponent(user.email)}?secret=${secret}&issuer=WINZA&algorithm=SHA1&digits=6&period=30`,requestId}); }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/confirm') { const {rows}=await pool.query('SELECT mfa_pending_secret_encrypted FROM users WHERE id=$1',[user.user_id]);if(!rows[0]?.mfa_pending_secret_encrypted||!auth.validTotp(auth.decrypt(rows[0].mfa_pending_secret_encrypted),data.code))return fail(res,400,'Invalid authenticator code.',requestId);await pool.query('UPDATE users SET mfa_secret_encrypted=mfa_pending_secret_encrypted,mfa_pending_secret_encrypted=NULL,mfa_enabled_at=now() WHERE id=$1',[user.user_id]);audit(user.user_id,'auth.mfa_enabled',ip);return send(res,200,{message:'MFA enabled.',requestId}); }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/disable') { if(!data.code)return fail(res,400,'Authenticator code is required.',requestId);const {rows}=await pool.query('SELECT mfa_secret_encrypted FROM users WHERE id=$1',[user.user_id]);if(!rows[0]?.mfa_secret_encrypted||!auth.validTotp(auth.decrypt(rows[0].mfa_secret_encrypted),data.code))return fail(res,400,'Invalid authenticator code.',requestId);await pool.query('UPDATE users SET mfa_secret_encrypted=NULL,mfa_enabled_at=NULL WHERE id=$1',[user.user_id]);audit(user.user_id,'auth.mfa_disabled',ip);return send(res,200,{message:'MFA disabled.',requestId}); }
+  return fail(res,404,'Not found',requestId);
+}
+
+// The single choke point where a confirmed provider payment turns into an
+// actual wallet credit. Called from both the webhook (authoritative,
+// server-to-server) and the browser callback redirect (just for snappier
+// UX) — safe to call twice for the same intent because wallet.postTransaction
+// is idempotent on (walletId, idempotencyKey), and this also short-circuits
+// once the intent already shows 'success'.
+async function creditDeposit(intentId, provider) {
+  const { rows }=await pool.query('SELECT * FROM payment_intents WHERE id=$1 AND provider=$2',[intentId,provider]);
+  const intent=rows[0];
+  if (!intent) return { ok:false, reason:'not_found' };
+  if (intent.status==='success') return { ok:true, alreadyPosted:true };
+  const verify = provider==='paystack'
+    ? await payments.paystackVerify(intent.provider_reference)
+    : await payments.opayVerify(intent.provider_reference);
+  if (!verify.success) {
+    await pool.query(`UPDATE payment_intents SET status='failed', updated_at=now() WHERE id=$1 AND status='pending'`,[intentId]);
+    return { ok:false, reason:'not_successful' };
+  }
+  // Trust the provider's confirmed amount over whatever was requested at
+  // initialize time — that's the only number that reflects money actually received.
+  const result=await wallet.postTransaction(pool,{
+    walletId:intent.wallet_id,
+    type:'deposit',
+    idempotencyKey:`${provider}:${intent.provider_reference}`,
+    referenceType:'payment_intent',
+    referenceId:intent.id,
+    entries:[{ balanceType:'cash_available', amount:verify.amount }],
+    metadata:{ provider },
+  });
+  await pool.query(`UPDATE payment_intents SET status='success', updated_at=now() WHERE id=$1`,[intentId]);
+  audit(intent.user_id,'wallet.deposit_confirmed',null,{ provider, amount:verify.amount, reference:intent.provider_reference });
+  return { ok:true, alreadyPosted:result.alreadyPosted };
+}
+
+// Public routes: the browser return redirect (no session — the player's
+// browser is just bouncing back from the provider's hosted page) and the
+// server-to-server webhook (no session either — authenticated purely by its
+// signature). Neither can be folded into handleAuth's session-gated routing.
+async function handlePayments(req,res,url,requestId,ip) {
+  if (!pool) return fail(res,503,'Payments are not configured.',requestId);
+
+  const cbMatch = req.method==='GET' && url.pathname.match(/^\/api\/v1\/payments\/callback\/(paystack|opay)$/);
+  if (cbMatch) {
+    const provider=cbMatch[1];
+    const reference=url.searchParams.get('reference');
+    let outcome='failed';
+    if (reference) {
+      try { const result=await creditDeposit(reference,provider); outcome=result.ok?'success':'failed'; }
+      catch(e) { console.error(`[${requestId}] ${provider} callback error`,e); }
+    }
+    res.writeHead(302,{ Location:`/?deposit=${outcome}`, 'Cache-Control':'no-store' });
+    return res.end();
+  }
+
+  const whMatch = req.method==='POST' && url.pathname.match(/^\/api\/v1\/payments\/webhook\/(paystack|opay)$/);
+  if (whMatch) {
+    const provider=whMatch[1];
+    const raw=await rawBody(req);
+    const signatureHeader = provider==='paystack' ? req.headers['x-paystack-signature'] : req.headers['signature'];
+    const valid = provider==='paystack'
+      ? payments.paystackVerifySignature(raw,signatureHeader)
+      : payments.opayVerifySignature(raw,signatureHeader);
+    if (!valid) { audit(null,'webhook.signature_invalid',ip,{provider}); return fail(res,401,'Invalid signature.',requestId); }
+    let payload; try { payload=JSON.parse(raw); } catch { return fail(res,400,'Invalid payload.',requestId); }
+    const reference = provider==='paystack' ? payload?.data?.reference : (payload?.payload?.reference || payload?.reference);
+    if (reference) {
+      try { await creditDeposit(reference,provider); }
+      catch(e) { console.error(`[${requestId}] ${provider} webhook credit error`,e); }
+    }
+    // Always acknowledge quickly so the provider doesn't retry-storm this
+    // endpoint; a failed credit above is still recoverable from the
+    // 'pending' payment_intents row and reconciled by hand if needed.
+    return send(res,200,{ received:true, requestId });
+  }
+
   return fail(res,404,'Not found',requestId);
 }
 
@@ -277,8 +408,9 @@ const server = http.createServer(async (req,res) => {
   res.setHeader('X-Request-Id',requestId);
   try {
     if(req.method==='GET'&&url.pathname==='/healthz')return send(res,200,{ok:true,mode:MODE,databaseConfigured:Boolean(pool),requestId});
-    if(req.method==='GET'&&url.pathname==='/api/v1/public/config'){const rtp=await getGameRtp();return send(res,200,{mode:MODE,realMoneyEnabled:false,rtp,rtpMin:rtpConfig.RTP_MIN,rtpMax:rtpConfig.RTP_MAX,message:'Payments and real-money play are disabled until licensed production services are configured.',requestId});}
+    if(req.method==='GET'&&url.pathname==='/api/v1/public/config'){const rtp=await getGameRtp();return send(res,200,{mode:MODE,realMoneyEnabled:false,rtp,rtpMin:rtpConfig.RTP_MIN,rtpMax:rtpConfig.RTP_MAX,depositProviders:payments.configuredProviders(),message:'Payments and real-money play are disabled until licensed production services are configured.',requestId});}
     if(req.method==='GET'&&url.pathname==='/rtp-config.js')return fs.readFile(path.join(root,'rtp-config.js'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'application/javascript; charset=utf-8'));
+    if(url.pathname.startsWith('/api/v1/payments/'))return await handlePayments(req,res,url,requestId,ip);
     if(url.pathname.startsWith('/api/v1/admin/'))return await handleAdmin(req,res,url,requestId,ip);
     if(url.pathname.startsWith('/api/v1/auth/')||url.pathname.startsWith('/api/v1/wallet/')||url.pathname.startsWith('/api/v1/kyc/'))return await handleAuth(req,res,url,requestId,ip);
     if(req.method==='GET'&&(url.pathname==='/'||url.pathname==='/winza.html'))return fs.readFile(path.join(root,'winza.html'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));

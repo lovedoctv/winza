@@ -407,7 +407,8 @@
   <div class="modal" id="modalBox">
     <h3 id="modalTitle">Deposit</h3>
     <input type="number" id="modalInput" placeholder="Amount" min="1">
-    <div class="modal-actions">
+    <div class="modal-actions" id="modalProviderRow" style="display:none;"></div>
+    <div class="modal-actions" id="modalDefaultRow">
       <button class="btn-cancel" onclick="closeModal()">Cancel</button>
       <button class="btn-confirm" id="modalConfirm">Confirm</button>
     </div>
@@ -1404,18 +1405,62 @@
     if (tab === 'settings') renderSettingsToggles();
   };
 
-  window.openDeposit = function() {
-    el.modalTitle.textContent = 'Deposits not configured';
+  let depositProvidersCache = null;
+  async function fetchDepositProviders() {
+    if (depositProvidersCache) return depositProvidersCache;
+    try {
+      const response = await fetch('/api/v1/public/config');
+      const data = await response.json();
+      depositProvidersCache = data.depositProviders || [];
+    } catch (e) { depositProvidersCache = []; }
+    return depositProvidersCache;
+  }
+  const DEPOSIT_PROVIDER_LABELS = { paystack: 'Pay with Paystack', opay: 'Pay with OPay' };
+
+  window.openDeposit = async function() {
+    if (!sessionStorage.getItem('wz_access_token')) { showToast('Sign in first to make a deposit.'); return; }
+    const providerRow = document.getElementById('modalProviderRow');
+    const defaultRow = document.getElementById('modalDefaultRow');
     el.modalInput.value = '';
-    el.modalInput.placeholder = 'Enter amount';
+    el.modalInput.placeholder = 'Enter amount (min ₦100)';
     el.modalOverlay.classList.add('show');
-    el.modalConfirm.onclick = () => {
-      const amt = Number(el.modalInput.value);
-      if (amt > 0) {
+    const providers = await fetchDepositProviders();
+    if (!providers.length) {
+      el.modalTitle.textContent = 'Deposits not configured';
+      providerRow.style.display = 'none';
+      defaultRow.style.display = 'flex';
+      el.modalConfirm.onclick = () => {
         showToast('Payments are unavailable until the live payment service is configured.');
-      }
-      closeModal();
-    };
+        closeModal();
+      };
+      return;
+    }
+    el.modalTitle.textContent = 'Deposit';
+    defaultRow.style.display = 'none';
+    providerRow.style.display = 'flex';
+    providerRow.innerHTML = '<button class="btn-cancel" onclick="closeModal()">Cancel</button>' +
+      providers.map(p => `<button class="btn-confirm" data-provider="${p}">${DEPOSIT_PROVIDER_LABELS[p] || p}</button>`).join('');
+    providerRow.querySelectorAll('[data-provider]').forEach(btn => {
+      btn.onclick = async () => {
+        const amt = Number(el.modalInput.value);
+        if (!(amt >= 100)) { showToast('Enter at least ₦100.'); return; }
+        const provider = btn.dataset.provider;
+        closeModal();
+        try {
+          const token = sessionStorage.getItem('wz_access_token');
+          const response = await fetch('/api/v1/wallet/deposits/initialize', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + token },
+            body: JSON.stringify({ provider, amount: amt }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.error || 'Unable to start payment.');
+          window.location.href = data.redirectUrl;
+        } catch (error) {
+          showToast(error.message);
+        }
+      };
+    });
   };
 
   window.openWithdraw = function() {
@@ -2058,11 +2103,25 @@
     save();
   });
 
+  async function handleDepositReturn() {
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get('deposit');
+    if (!outcome) return;
+    history.replaceState(null, '', window.location.pathname);
+    if (outcome === 'success') {
+      showToast('Deposit successful!');
+      switchTab('wallet');
+      await refreshServerWallet();
+    } else {
+      showToast('Deposit was not completed.');
+    }
+  }
+
   load();
   setInterval(renderRGLockBanner, 30000);
   setupEnhancements();
   checkDailyBonus();
-  restoreSession();
+  restoreSession().then(handleDepositReturn);
 })();
 </script>
 <script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a21cfeaa9a31b95c',t:'MTc4NTE2OTQ3MQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
