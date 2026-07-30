@@ -1,0 +1,10 @@
+{
+  "appId": "com.winza.app",
+  "appName": "WINZA",
+  "webDir": "www",
+  "server": {
+    "url": "https://winza-gjl6.onrender.com",
+    "cleartext": false,
+    "androidScheme": "https"
+  }
+}

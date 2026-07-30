@@ -128,6 +128,12 @@ owner-audited invite workflow is still a "later, reviewed feature," same as befo
 Roles are stored server-side: `player`, `support`, `risk`, `admin`, and `owner`.
 Players always get `player` on registration.
 
+## Mobile app
+
+`mobile/` is a Capacitor wrapper that loads this same deployed site inside a
+native Android/iOS shell — no separate frontend to maintain. See
+`mobile/README.md` for building, signing, and app-store submission notes.
+
 ## Required before real-money launch
 
 - Licensed-jurisdiction rules, age gating, responsible gambling and self-exclusion.
