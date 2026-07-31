@@ -33,12 +33,15 @@ login/verify and must be sent as `Authorization: Bearer <token>`.
 **Players** register and log in with phone + OTP — the same endpoint handles both;
 the first successful verification for a phone number creates the account.
 - `POST /api/v1/auth/otp/request` — `{ phone }`. Sends a 6-digit code, 5-minute expiry.
-  No SMS provider is configured out of the box — see `OTP_SMS_WEBHOOK_URL` in
-  `.env.example`. Until that's wired up, set `OTP_DEV_ECHO=true` locally to get
-  the code back in the response as a `devCode` field for testing. Leave
-  `OTP_DEV_ECHO` unset in any deployment real users can reach — including the
-  sandbox build shipped to the Play Store — or anyone can read back the OTP
-  for any phone number and take over that account.
+  No SMS provider is configured out of the box. Delivery is tried in order:
+  Termii (`termii.js` — a built-in integration, set `TERMII_API_KEY` and
+  `TERMII_SENDER_ID` in `.env.example`), then `OTP_SMS_WEBHOOK_URL` (point it at
+  any other provider — Africa's Talking, Twilio, etc.). Until one of those is
+  wired up, set `OTP_DEV_ECHO=true` locally to get the code back in the
+  response as a `devCode` field for testing. Leave `OTP_DEV_ECHO` unset in any
+  deployment real users can reach — including the sandbox build shipped to
+  the Play Store — or anyone can read back the OTP for any phone number and
+  take over that account.
 - `POST /api/v1/auth/otp/verify` — `{ phone, code }`. Returns `{ user, accessToken, isNewAccount }`.
 
 No KYC fields are collected at registration — a new account starts with

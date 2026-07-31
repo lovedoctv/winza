@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const termii = require('./termii');
 
 // Accepts +234XXXXXXXXXX (already international), 0XXXXXXXXXX (Nigerian local
 // format), or 234XXXXXXXXXX, and normalizes to E.164 (+234XXXXXXXXXX).
@@ -19,19 +20,30 @@ function hashCode(code) {
   return crypto.createHash('sha256').update(code).digest('hex');
 }
 
-// Pluggable delivery. If OTP_SMS_WEBHOOK_URL is set, the phone number and code
-// are POSTed to it — your actual SMS provider (Termii, Africa's Talking,
-// Twilio, etc.) lives behind that webhook, not in this codebase. If it's not
-// configured, delivery simply doesn't happen; the caller decides what to do
-// with that (server.js only echoes the code back in non-live modes, purely so
-// the flow is testable before a provider is wired in).
+// Pluggable delivery, tried in order:
+//   1. Termii (termii.js), if TERMII_API_KEY is configured — a direct,
+//      built-in integration, since Termii is Nigeria-focused and this app's
+//      phone numbers always are too (see normalizePhone above).
+//   2. OTP_SMS_WEBHOOK_URL, if set — POSTs the phone number and message to
+//      it; any other SMS provider (Africa's Talking, Twilio, etc.) lives
+//      behind that webhook, not in this codebase.
+//   3. Neither configured: delivery simply doesn't happen; the caller
+//      decides what to do with that (server.js only echoes the code back in
+//      non-live modes, purely so the flow is testable before a provider is
+//      wired in).
 async function sendOtpSms(phone, code) {
+  const message = `Your WINZA verification code is ${code}. It expires in 5 minutes.`;
+
+  const termiiResult = await termii.sendSms(phone, message);
+  if (termiiResult.delivered) return termiiResult;
+  if (termiiResult.reason !== 'termii_not_configured') return termiiResult;
+
   const webhook = process.env.OTP_SMS_WEBHOOK_URL;
   if (!webhook) return { delivered: false, reason: 'no_provider_configured' };
   await fetch(webhook, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ phone, message: `Your WINZA verification code is ${code}. It expires in 5 minutes.` }),
+    body: JSON.stringify({ phone, message }),
   });
   return { delivered: true };
 }
