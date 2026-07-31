@@ -571,13 +571,13 @@
 
   <div class="tab-panel" id="tab-wallet">
     <div class="wallet-balance-card">
-      <div class="label">Available Balance (demo)</div>
+      <div class="label">Available Balance</div>
       <div class="amount" id="walletBalance">₦0</div>
     </div>
     <div class="wallet-balance-card" style="margin-top:-4px;">
       <div class="label">Your Account Balance</div>
       <div class="amount" id="accountBalance" style="font-size:22px;">Sign in to view</div>
-      <div class="settings-card-sub" id="accountBalanceNote" style="margin-top:6px;">Sign in to see your real account balance. This is separate from the play-money demo above.</div>
+      <div class="settings-card-sub" id="accountBalanceNote" style="margin-top:6px;">Sign in to view and play — this is the same balance shown above, the one every spin/draw stakes and pays out against.</div>
     </div>
     <div class="wallet-balance-card" style="margin-top:-4px;">
       <div class="label">Identity Verification</div>
@@ -712,15 +712,14 @@
 <script src="/rtp-config.js"></script>
 <script>
 (function () {
-  const MIN_CHANCE = 0.03;
-  const MAX_CHANCE = 0.9;
   // Loaded from /rtp-config.js — the same module the server uses, so the
-  // client can never accept an RTP outside what the backend would also
-  // accept (see server.js's rtpConfig usage and its enforce_game_rtp_bounds
-  // trigger in schema.sql).
-  const { RTP_MIN, RTP_MAX, RTP_DEFAULT, sanitizeRtp } = window.WINZA_RTP_CONFIG;
+  // client's pre-bet odds/payout preview can never drift from what the
+  // backend actually resolves a bet with (see server.js's rtpConfig usage
+  // and game-engine.js). This is a preview only: the client never uses these
+  // to decide win/loss — see buyTicket()/finishDraw() further down.
+  const rtpConfig = window.WINZA_RTP_CONFIG;
+  const { RTP_MIN, RTP_MAX, RTP_DEFAULT, sanitizeRtp, computePayout } = rtpConfig;
   const STORAGE_KEY = 'winza-v1';
-  const START_BALANCE = 50000;
   const SLICES = 24;
   const COLORS = { gold: '#F5A623', coral: '#E8523C', plum: '#2A1B4D', ink: '#1A1033', chalk: '#F5EFE2' };
 
@@ -764,7 +763,7 @@
   };
 
   let state = {
-    balance: START_BALANCE, xp: 0, history: [], ticketsBought: 0, totalWon: 0,
+    xp: 0, history: [], ticketsBought: 0, totalWon: 0,
     streak: 0, bestStreak: 0, lastStake: 100, lastMultiplier: 10, mode: 'wheel',
     transactions: [], loyaltyPoints: 0, totalWagered: 0,
     referralCode: '', referralCount: 0, referralEarnings: 0,
@@ -777,7 +776,13 @@
   let isSpinning = false;
   let audioCtx = null;
   let currentTab = 'play';
-  let serverWallet = null; // the real, server-authoritative balance — separate from state.balance (demo tokens)
+  // The real, server-authoritative balance — the ONLY balance the wheel/lotto
+  // game stakes and pays out against (see buyTicket()/finishDraw() below and
+  // /api/v1/games/bets in server.js). Never mutated locally: every change to
+  // it comes from a server response (bet result, faucet credit, deposit,
+  // withdrawal), never from client-side arithmetic.
+  let serverWallet = null;
+  function walletBalance() { return Number(serverWallet && serverWallet.cashAvailable || 0); }
 
   const el = {
     balance: document.getElementById('balance'),
@@ -974,12 +979,10 @@
   function vipFromWagered(w) { let idx = 0; for (let i = 0; i < VIP_TIERS.length; i++) if (w >= VIP_TIERS[i].threshold) idx = i; return idx; }
   function currentStake() { return Number(el.stakeSlider.value); }
   function currentMultiplier() { return Number(el.multSlider.value); }
-  function computePayout(stake, mult) { return Math.round((stake * mult) / 100) * 100; }
-  // RTP is validated on every read here, not just when it's assigned — this
-  // is what actually prevents an out-of-range or corrupted RTP (a tampered
-  // save, a bypassed slider) from ever reaching the game's odds math,
-  // regardless of how state.config.rtp got that way.
-  function computeChance(mult) { return clamp(sanitizeRtp(state.config.rtp) / mult, MIN_CHANCE, MAX_CHANCE); }
+  // Delegates to the shared formula in rtp-config.js (which also validates
+  // RTP on every read) so this preview can never drift from what the server
+  // actually resolves a bet with — see the module-level note above.
+  function computeChance(mult) { return rtpConfig.computeChance(state.config.rtp, mult); }
   function randomCode() {
     const chars = '0123456789ABCDEFGHJKMNPQRSTUVWXYZ';
     let c = '';
@@ -1195,8 +1198,8 @@
     el.buyBtn.textContent = state.mode === 'wheel' ? `Spin — ₦${stake.toLocaleString()}` : `Draw — ₦${stake.toLocaleString()}`;
     const min = Number(el.multSlider.min), max = Number(el.multSlider.max);
     el.gaugeMarker.style.left = (((mult - min) / (max - min)) * 100) + '%';
-    el.buyBtn.disabled = state.balance < stake || isSpinning;
-    el.emptyState.hidden = state.balance >= stake;
+    el.buyBtn.disabled = walletBalance() < stake || isSpinning;
+    el.emptyState.hidden = walletBalance() >= stake;
     updateChips(el.stakeChips, stake);
     updateChips(el.multChips, mult);
     if (state.mode === 'wheel') renderWheelIfNeeded();
@@ -1204,8 +1207,7 @@
   }
 
   function render() {
-    el.balance.textContent = state.balance.toLocaleString();
-    el.walletBalance.textContent = formatMoney(state.balance);
+    renderAccountWallet();
     const idx = levelFromXp(state.xp);
     const current = LEVELS[idx], next = LEVELS[idx + 1];
     el.level.textContent = idx + 1;
@@ -1293,7 +1295,7 @@
   }
 
   function renderLeaderboard() {
-    const userEntry = { name: state.playerName + ' (You)', balance: state.balance, streak: state.bestStreak, isYou: true };
+    const userEntry = { name: state.playerName + ' (You)', balance: walletBalance(), streak: state.bestStreak, isYou: true };
     const all = [...LEADERBOARD_DATA, userEntry].sort((a, b) => b.balance - a.balance);
     el.leaderboardList.innerHTML = all.slice(0, 8).map((p, i) => {
       const rankClass = i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
@@ -1315,20 +1317,29 @@
     }).join('');
   }
 
+  // Loyalty points only, never cash — since balance is now the real,
+  // server-authoritative wallet (see walletBalance()), nothing client-side
+  // is allowed to credit it directly. Use the sandbox faucet (Play tab, or
+  // /api/v1/wallet/sandbox-credit) to top up balance for testing instead.
   function checkDailyBonus() {
     const lastLogin = localStorage.getItem('wz_last_login');
     const today = new Date().toDateString();
     if (lastLogin !== today) {
-      state.balance += 5000;
-      state.loyaltyPoints += 50;
-      addTx('deposit', 5000, 'Daily login bonus');
+      state.loyaltyPoints += 200;
       localStorage.setItem('wz_last_login', today);
-      showToast('🎁 Daily bonus: ₦5,000 + 50 pts credited!');
+      showToast('🎁 Daily bonus: 200 loyalty points credited!');
       render();
       save();
     }
   }
 
+  // Places a real bet against the server. The client never decides win or
+  // loss, never computes a payout, and never mutates the balance itself —
+  // it only sends {gameId, stake, multiplier} to /api/v1/games/bets and
+  // renders whatever the server hands back (see finishDraw() below). The
+  // only randomness left on this side of the wire is picking *which*
+  // already-same-outcome wheel wedge to visually land on (see the
+  // `candidates` line below) — that's cosmetic placement, not the result.
   async function buyTicket() {
     if (isSpinning) return;
     const lock = rgLockState();
@@ -1338,10 +1349,19 @@
         : `Cool-off active for ${fmtRemaining(lock.until - Date.now())} more — play is paused`);
       return;
     }
+    const token = sessionStorage.getItem('wz_access_token');
+    if (!token) {
+      showToast('Sign in to play — every spin is a real, server-recorded bet.');
+      openAuth();
+      return;
+    }
     initAudio();
     const stake = currentStake();
     const mult = currentMultiplier();
-    if (state.balance < stake) return;
+    if (walletBalance() < stake) {
+      showToast('Insufficient balance — deposit or refill to keep playing.');
+      return;
+    }
     if (state.rg.stakeLimit && stake > state.rg.stakeLimit) {
       showToast(`Stake limit is ₦${state.rg.stakeLimit.toLocaleString()} per spin — lower your stake or update it in Settings`);
       return;
@@ -1353,16 +1373,42 @@
     el.stakeSlider.disabled = true;
     el.multSlider.disabled = true;
     document.querySelectorAll('.mode-btn').forEach(b => b.disabled = true);
-    state.balance -= stake;
-    state.totalWagered += stake;
-    state.loyaltyPoints += Math.floor(stake / 100);
-    el.balance.textContent = state.balance.toLocaleString();
     el.ticketCode.textContent = randomCode();
     el.stamp.className = 'stamp';
     el.stamp.textContent = '';
-    const win = Math.random() < computeChance(mult);
-    const payout = computePayout(stake, mult);
+
+    const resetControls = () => {
+      isSpinning = false;
+      el.stakeSlider.disabled = false;
+      el.multSlider.disabled = false;
+      document.querySelectorAll('.mode-btn').forEach(b => b.disabled = false);
+      el.buyBtn.disabled = walletBalance() < currentStake();
+    };
+
+    let result;
+    try {
+      const response = await fetch('/api/v1/games/bets', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + token },
+        // clientRequestId is generated fresh per spin/draw and never reused —
+        // it's what lets the server treat a retried/duplicated submission as
+        // a safe no-op instead of a second charge.
+        body: JSON.stringify({ gameId: state.mode, stake, multiplier: mult, clientRequestId: crypto.randomUUID() }),
+      });
+      result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || 'Unable to place bet.');
+    } catch (error) {
+      resetControls();
+      showToast(error.message);
+      return;
+    }
+
+    serverWallet = { ...(serverWallet || {}), cashAvailable: result.balance };
+    renderAccountWallet();
     addTx('loss', -stake, `${state.mode === 'wheel' ? 'Wheel' : 'Lotto'} stake`);
+
+    const win = result.outcome === 'win';
+    const payout = Number(result.payout || 0);
 
     if (state.mode === 'wheel') {
       const candidates = currentSlices.filter(s => s.type === (win ? 'prize' : 'lose'));
@@ -1373,20 +1419,22 @@
       el.wheelSvg.addEventListener('transitionend', function handler() {
         el.wheelSvg.removeEventListener('transitionend', handler);
         clearInterval(tickInterval);
-        finishDraw(win, payout, stake, mult);
+        finishDraw(win, payout, stake, mult, resetControls);
       }, { once: true });
     } else {
       await animateLottoDraw(win);
-      finishDraw(win, payout, stake, mult);
+      finishDraw(win, payout, stake, mult, resetControls);
     }
   }
 
-  function finishDraw(win, payout, stake, mult) {
+  // Renders the outcome the server already decided — this function never
+  // computes win/loss or touches the balance; `win`/`payout` come straight
+  // from the /api/v1/games/bets response in buyTicket() above.
+  function finishDraw(win, payout, stake, mult, resetControls) {
     if (win) {
       el.stamp.textContent = 'JACKPOT!';
       el.stamp.classList.add('show-win');
       state.totalWon += payout;
-      state.balance += payout;
       state.streak += 1;
       state.bestStreak = Math.max(state.bestStreak, state.streak);
       playWin();
@@ -1401,6 +1449,8 @@
       if (state.hapticEnabled && navigator.vibrate) navigator.vibrate([100, 50, 100]);
     }
     state.ticketsBought += 1;
+    state.totalWagered += stake;
+    state.loyaltyPoints += Math.floor(stake / 100);
     recordSpin(win, payout, stake);
     state.xp += 10;
     state.history.unshift({ code: el.ticketCode.textContent, win, multiplier: mult, payout, stake });
@@ -1408,13 +1458,7 @@
     lastPrizeCount = null;
     render();
     save();
-    setTimeout(() => {
-      isSpinning = false;
-      el.stakeSlider.disabled = false;
-      el.multSlider.disabled = false;
-      document.querySelectorAll('.mode-btn').forEach(b => b.disabled = false);
-      el.buyBtn.disabled = state.balance < currentStake();
-    }, 500);
+    setTimeout(resetControls, 500);
   }
 
   window.switchTab = function(tab) {
@@ -1435,6 +1479,12 @@
       const response = await fetch('/api/v1/public/config');
       const data = await response.json();
       depositProvidersCache = data.depositProviders || [];
+      // The RTP the server actually resolves bets with — refreshes the
+      // Licence & Legal disclosure (see renderLegalRtp()) so it can never
+      // show a stale or locally-tampered figure. isValidRtp guards against a
+      // malformed/unexpected response the same way the server's own
+      // getGameRtp() guards against a bad stored value.
+      if (rtpConfig.isValidRtp(data.rtp)) { state.config.rtp = data.rtp; renderLegalRtp(); }
     } catch (e) { depositProvidersCache = []; }
     return depositProvidersCache;
   }
@@ -1518,15 +1568,23 @@
     el.modalOverlay.classList.remove('show');
   };
 
-  window.redeemLoyalty = function() {
+  // Credits the real, server-tracked balance (via creditSandbox(), defined
+  // further down alongside the other cash-rewarding gimmicks) rather than
+  // adding to a local number, since balance is no longer something the
+  // client is allowed to change on its own.
+  window.redeemLoyalty = async function() {
     if (state.loyaltyPoints < 500) return;
-    state.loyaltyPoints -= 500;
-    state.balance += 1000;
-    addTx('loyalty', 1000, 'Loyalty reward redeemed');
-    playCoin();
-    showToast('Redeemed 500 pts for ₦1,000!');
-    render();
-    save();
+    try {
+      await creditSandbox(1000);
+      state.loyaltyPoints -= 500;
+      addTx('loyalty', 1000, 'Loyalty reward redeemed');
+      playCoin();
+      showToast('Redeemed 500 pts for ₦1,000!');
+      render();
+      save();
+    } catch (error) {
+      showToast(error.message);
+    }
   };
 
   window.copyReferral = function() {
@@ -1590,7 +1648,7 @@
     localStorage.removeItem(STORAGE_KEY);
     localStorage.removeItem('wz_last_login');
     state = {
-      balance: START_BALANCE, xp: 0, history: [], ticketsBought: 0, totalWon: 0,
+      xp: 0, history: [], ticketsBought: 0, totalWon: 0,
       streak: 0, bestStreak: 0, lastStake: 100, lastMultiplier: 10, mode: 'wheel',
       transactions: [], loyaltyPoints: 0, totalWagered: 0,
       referralCode: generateReferral(), referralCount: 0, referralEarnings: 0,
@@ -1884,7 +1942,7 @@
 
   function populateAdminPlayers() {
     const you = {
-      name: state.playerName + ' (You)', balance: state.balance,
+      name: state.playerName + ' (You)', balance: walletBalance(),
       vip: VIP_TIERS[vipFromWagered(state.totalWagered)].name, active: 'Online now'
     };
     const others = LEADERBOARD_DATA.map((p, i) => ({
@@ -2018,16 +2076,84 @@
     const played=state.ticketsBought, wins=state.history.filter(h=>h.win).length, avg=played?Math.round(state.totalWagered/played):0, profit=state.totalWon-state.totalWagered;
     const stats=document.getElementById('enhancedStats');if(stats) stats.innerHTML=[['Total wagered','₦'+state.totalWagered.toLocaleString()],['Total won','₦'+state.totalWon.toLocaleString()],['Win rate',played?(wins/played*100).toFixed(1)+'%':'0%'],['Loss rate',played?((played-wins)/played*100).toFixed(1)+'%':'0%'],['Average bet','₦'+avg.toLocaleString()],['Profit',(profit<0?'-':'')+'₦'+Math.abs(profit).toLocaleString()],['Games played',played],['Best streak',state.bestStreak]].map(x=>`<div class="stat-mini"><b>${x[1]}</b><small>${x[0]}</small></div>`).join('');
     const luckToday=state.enhance.lastLuckySpin===new Date().toDateString(),lbtn=document.getElementById('luckySpinBtn'),lt=document.getElementById('luckySpinTimer');if(lbtn){lbtn.disabled=luckToday;lbtn.textContent=luckToday?'Available tomorrow':'Spin for free';}if(lt)lt.textContent=luckToday?'Next free spin in '+untilMidnight():'One free spin is ready.';
-    const rank=document.getElementById('tournamentRank');if(rank)rank.textContent=Math.max(1,Math.round(1248-(state.balance/1000)));
+    const rank=document.getElementById('tournamentRank');if(rank)rank.textContent=Math.max(1,Math.round(1248-(walletBalance()/1000)));
     const feed=document.getElementById('liveFeed');if(feed)feed.innerHTML=liveFeed.slice(0,6).map(f=>`<div class="feed-row">🎉 <b>${f.name}</b> ${f.text}<small class="subtle" style="float:right">now</small></div>`).join('')||'<div class="subtle">Connecting to live winners…</div>';
   }
   function recordSpin(win,payout,stake){ if(state.ticketsBought%10===0){state.enhance.luckyBoxes++;notify('Lucky Box unlocked after 10 spins');} if(win) notify('Winning draw: ₦'+payout.toLocaleString()); renderEnhancements(); }
   window.openDailyReward=()=>{renderEnhancements();document.getElementById('dailyRewardModal').classList.add('show');}; window.closeDailyReward=()=>document.getElementById('dailyRewardModal').classList.remove('show');
-  document.getElementById('claimDailyBtn').addEventListener('click',()=>{const r=DAILY_REWARDS[state.enhance.rewardDay%7];if(typeof r==='number'){state.balance+=r;addTx('deposit',r,'Daily reward');}else if(r==='Bonus XP')state.xp+=100;else if(r==='Mystery Box')state.enhance.luckyBoxes++;else state.balance+=1000;state.enhance.lastReward=new Date().toDateString();state.enhance.rewardDay++;notify('Daily reward claimed');playCoin();fireConfetti();save();render();renderEnhancements();closeDailyReward();showToast('Reward claimed!');});
+  document.getElementById('claimDailyBtn').addEventListener('click',async()=>{
+    const r=DAILY_REWARDS[state.enhance.rewardDay%7];
+    try {
+      if(typeof r==='number'){await creditSandbox(r);addTx('deposit',r,'Daily reward');}
+      else if(r==='Bonus XP')state.xp+=100;
+      else if(r==='Mystery Box')state.enhance.luckyBoxes++;
+      else await creditSandbox(1000);
+      state.enhance.lastReward=new Date().toDateString();state.enhance.rewardDay++;
+      notify('Daily reward claimed');playCoin();fireConfetti();save();render();renderEnhancements();closeDailyReward();showToast('Reward claimed!');
+    } catch(error){showToast(error.message);}
+  });
   window.openNotifications=()=>{const list=document.getElementById('notificationList');list.innerHTML=state.enhance.notifications.map(n=>`<div class="notification-row">${n.message}<small class="subtle" style="display:block">${timeAgo(n.time)}</small></div>`).join('')||'<p class="subtle">No notifications yet.</p>';document.getElementById('notificationModal').classList.add('show');};window.closeNotifications=()=>document.getElementById('notificationModal').classList.remove('show');
-  window.spinLuckyWheel=()=>{if(state.enhance.lastLuckySpin===new Date().toDateString())return;const rewards=[['₦2,000',2000],['50 XP',0],['100 loyalty',0],['Free ticket',1000]];const r=rewards[Math.floor(Math.random()*rewards.length)],wheel=document.getElementById('luckyWheel');wheel.style.transform='rotate('+((Math.random()*360)+1440)+'deg)';setTimeout(()=>{if(r[1]){state.balance+=r[1];addTx('deposit',r[1],'Lucky wheel reward');}else if(r[0]==='50 XP')state.xp+=50;else state.loyaltyPoints+=100;state.enhance.lastLuckySpin=new Date().toDateString();notify('Lucky Spin reward: '+r[0]);save();render();renderEnhancements();showToast('Lucky Spin: '+r[0]);},3050);};
-  window.openLuckyBox=()=>{if(!state.enhance.luckyBoxes)return;const rewards=[['₦5,000',5000],['200 XP',0],['Multiplier boost',1500],['100 loyalty points',0]],r=rewards[Math.floor(Math.random()*rewards.length)];state.enhance.luckyBoxes--;if(r[1]){state.balance+=r[1];addTx('deposit',r[1],'Lucky Box reward');}else if(r[0]==='200 XP')state.xp+=200;else state.loyaltyPoints+=100;notify('Lucky Box opened: '+r[0]);fireConfetti();save();render();renderEnhancements();showToast('Lucky Box: '+r[0]);};
-  window.redeemPromo=()=>{const input=document.getElementById('promoInput'),code=input.value.trim().toUpperCase(),rewards={WELCOME100:1000,WINZA2026:2026,VIP500:500};if(!rewards[code])return showToast('Invalid promo code');if(state.enhance.promoCodes.includes(code))return showToast('Code already redeemed');state.enhance.promoCodes.push(code);state.balance+=rewards[code];addTx('deposit',rewards[code],'Promo '+code);notify('Promo reward credited');input.value='';save();render();renderEnhancements();showToast('Promo applied: ₦'+rewards[code].toLocaleString());};
+  // Shared by the three cash-rewarding gimmicks below: any reward with real
+  // cash value has to land in the real, server-tracked wallet via the same
+  // sandbox faucet the Play tab's refill button uses (bounded server-side,
+  // inert once WINZA_MODE=live) — nothing client-side is allowed to credit
+  // balance directly. Requires sign-in; throws on failure so callers can
+  // decide whether to still consume the free spin/box/code.
+  async function creditSandbox(amount) {
+    const token = sessionStorage.getItem('wz_access_token');
+    if (!token) { openAuth(); throw new Error('Sign in to claim cash rewards.'); }
+    const response = await fetch('/api/v1/wallet/sandbox-credit', { method: 'POST', headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + token }, body: JSON.stringify({ amount }) });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || 'Unable to credit balance.');
+    serverWallet = data.wallet;
+  }
+
+  window.spinLuckyWheel = async function() {
+    if (state.enhance.lastLuckySpin === new Date().toDateString()) return;
+    const rewards = [['₦2,000', 2000], ['50 XP', 0], ['100 loyalty', 0], ['Free ticket', 1000]];
+    const r = rewards[Math.floor(Math.random() * rewards.length)], wheel = document.getElementById('luckyWheel');
+    wheel.style.transform = 'rotate(' + ((Math.random() * 360) + 1440) + 'deg)';
+    setTimeout(async () => {
+      try {
+        if (r[1]) { await creditSandbox(r[1]); addTx('deposit', r[1], 'Lucky wheel reward'); }
+        else if (r[0] === '50 XP') state.xp += 50;
+        else state.loyaltyPoints += 100;
+        state.enhance.lastLuckySpin = new Date().toDateString();
+        notify('Lucky Spin reward: ' + r[0]);
+        save(); render(); renderEnhancements();
+        showToast('Lucky Spin: ' + r[0]);
+      } catch (error) { showToast(error.message); }
+    }, 3050);
+  };
+  window.openLuckyBox = async function() {
+    if (!state.enhance.luckyBoxes) return;
+    const rewards = [['₦5,000', 5000], ['200 XP', 0], ['Multiplier boost', 1500], ['100 loyalty points', 0]];
+    const r = rewards[Math.floor(Math.random() * rewards.length)];
+    try {
+      if (r[1]) { await creditSandbox(r[1]); addTx('deposit', r[1], 'Lucky Box reward'); }
+      else if (r[0] === '200 XP') state.xp += 200;
+      else state.loyaltyPoints += 100;
+      state.enhance.luckyBoxes--;
+      notify('Lucky Box opened: ' + r[0]);
+      fireConfetti(); save(); render(); renderEnhancements();
+      showToast('Lucky Box: ' + r[0]);
+    } catch (error) { showToast(error.message); }
+  };
+  window.redeemPromo = async function() {
+    const input = document.getElementById('promoInput'), code = input.value.trim().toUpperCase();
+    const rewards = { WELCOME100: 1000, WINZA2026: 2026, VIP500: 500 };
+    if (!rewards[code]) return showToast('Invalid promo code');
+    if (state.enhance.promoCodes.includes(code)) return showToast('Code already redeemed');
+    try {
+      await creditSandbox(rewards[code]);
+      state.enhance.promoCodes.push(code);
+      addTx('deposit', rewards[code], 'Promo ' + code);
+      notify('Promo reward credited');
+      input.value = '';
+      save(); render(); renderEnhancements();
+      showToast('Promo applied: ₦' + rewards[code].toLocaleString());
+    } catch (error) { showToast(error.message); }
+  };
   window.inviteFriend=()=>{state.enhance.friends++;notify('Friend invitation sent');save();showToast('Invite link copied (demo)');};window.setTheme=(theme)=>{state.enhance.theme=theme;document.body.classList.remove('theme-gold','theme-neon','theme-ocean');if(theme!=='classic')document.body.classList.add('theme-'+theme);save();showToast(theme+' theme applied');};
   // Account UI uses the server API. Local game data remains sandbox-only until wallet migration.
   window.handleAccountClick = function() {
@@ -2062,16 +2188,21 @@
   window.openAuth=()=>{document.getElementById('authTitle').textContent='Sign in to WINZA';document.getElementById('authPhoneForm').hidden=false;document.getElementById('authOtpForm').hidden=true;document.getElementById('authPhone').value='';document.getElementById('authModal').classList.add('show');};window.closeAuth=()=>document.getElementById('authModal').classList.remove('show');
   async function authRequest(endpoint,payload){const response=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Request failed');return data;}
 
-  // --- Real account balance (server wallet). Kept fully separate from state.balance,
-  // which is the local play-money demo used by the wheel/lotto game. There is no
-  // endpoint that lets the client change this balance; it can only ever go up once a
-  // reviewed deposit/payout feature is wired to wallet.postTransaction() server-side.
+  // --- Real account balance (server wallet). This is the ONE balance the
+  // wheel/lotto game plays with (see walletBalance() above) — there is no
+  // endpoint that lets the client change it directly; it only ever moves via
+  // a server response to a bet, a sandbox faucet credit (sandbox mode only),
+  // or a reviewed deposit/withdrawal wired to wallet.postTransaction()
+  // server-side.
   function renderAccountWallet() {
+    const balanceText = formatMoney(walletBalance());
+    if (el.walletBalance) el.walletBalance.textContent = balanceText;
+    if (el.balance) el.balance.textContent = walletBalance().toLocaleString();
     if (!el.accountBalance) return;
     const token = sessionStorage.getItem('wz_access_token');
     if (!token) {
       el.accountBalance.textContent = 'Sign in to view';
-      el.accountBalanceNote.textContent = 'Sign in to see your real account balance. This is separate from the play-money demo above.';
+      el.accountBalanceNote.textContent = 'Sign in to view and play — this is the same balance shown above, the one every spin/draw stakes and pays out against.';
       return;
     }
     if (!serverWallet) {
@@ -2079,8 +2210,8 @@
       el.accountBalanceNote.textContent = 'Unable to load your balance right now.';
       return;
     }
-    el.accountBalance.textContent = formatMoney(Number(serverWallet.cashAvailable || 0));
-    el.accountBalanceNote.textContent = 'Real-money play isn\'t enabled yet, so this stays at ₦0 for now — it\'s separate from the play-money demo above.';
+    el.accountBalance.textContent = balanceText;
+    el.accountBalanceNote.textContent = 'This is the same balance shown above. Real-money deposits aren\'t enabled yet — use the sandbox faucet on the Play tab to top up for testing.';
   }
 
   async function refreshServerWallet() {
@@ -2207,11 +2338,28 @@
   el.stakeSlider.addEventListener('input', updateRiskPanel);
   el.multSlider.addEventListener('input', updateRiskPanel);
   el.buyBtn.addEventListener('click', buyTicket);
-  el.resetBtn.addEventListener('click', () => {
-    state.balance = START_BALANCE;
-    addTx('deposit', START_BALANCE, 'Demo balance refill');
-    render();
-    save();
+  // Sandbox-only faucet (see /api/v1/wallet/sandbox-credit in server.js) —
+  // hard-disabled by the server the moment WINZA_MODE=live, so this can
+  // never manufacture real cash on a live deployment. Requires sign-in
+  // since the credit lands in your real, server-tracked wallet.
+  el.resetBtn.addEventListener('click', async () => {
+    const token = sessionStorage.getItem('wz_access_token');
+    if (!token) { showToast('Sign in to refill your balance.'); openAuth(); return; }
+    el.resetBtn.disabled = true;
+    try {
+      const response = await fetch('/api/v1/wallet/sandbox-credit', { method: 'POST', headers: { Authorization: 'Bearer ' + token } });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || 'Unable to refill balance.');
+      serverWallet = data.wallet;
+      addTx('deposit', 50000, 'Sandbox balance refill');
+      render();
+      save();
+      showToast('Balance refilled.');
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      el.resetBtn.disabled = false;
+    }
   });
 
   // The server has no dedicated verify-on-return endpoint — Paystack/OPay

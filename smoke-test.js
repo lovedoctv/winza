@@ -99,6 +99,66 @@ async function main() {
   const startsAtZero = Number(w.cashAvailable) === 0 && Number(w.bonusAvailable) === 0;
   record('GET /api/v1/wallet/me', res.ok && startsAtZero, JSON.stringify(w));
 
+  // 7a. Server-authoritative wheel/lotto betting: /api/v1/games/bets. The
+  // sandbox faucet (/api/v1/wallet/sandbox-credit) only responds outside
+  // WINZA_MODE=live, matching the OTP_DEV_ECHO gating pattern used above —
+  // on a live deployment this whole block is expected to 403 and skip.
+  res = await fetch(`${BASE_URL}/api/v1/wallet/sandbox-credit`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+  data = await json(res);
+  if (res.status === 403) {
+    console.log('(skipping betting checks — sandbox faucet is disabled, this deployment is WINZA_MODE=live)');
+  } else {
+    record('POST /api/v1/wallet/sandbox-credit funds the wallet', res.ok && Number(data.wallet?.cashAvailable) === 50000, JSON.stringify(data));
+
+    res = await fetch(`${BASE_URL}/api/v1/games/bets`, {
+      method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ gameId: 'not-a-real-game', stake: 1000, multiplier: 5, clientRequestId: crypto.randomUUID() }),
+    });
+    record('bet with invalid gameId rejected (400)', res.status === 400, JSON.stringify(await json(res)));
+
+    res = await fetch(`${BASE_URL}/api/v1/games/bets`, {
+      method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ gameId: 'wheel', stake: 1, multiplier: 5, clientRequestId: crypto.randomUUID() }),
+    });
+    record('bet below minimum stake rejected (400)', res.status === 400, JSON.stringify(await json(res)));
+
+    res = await fetch(`${BASE_URL}/api/v1/games/bets`, {
+      method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ gameId: 'wheel', stake: 1000, multiplier: 5.03, clientRequestId: crypto.randomUUID() }),
+    });
+    record('bet with off-step multiplier rejected (400)', res.status === 400, JSON.stringify(await json(res)));
+
+    const betRequestId = crypto.randomUUID();
+    res = await fetch(`${BASE_URL}/api/v1/games/bets`, {
+      method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ gameId: 'wheel', stake: 1000, multiplier: 5, clientRequestId: betRequestId }),
+    });
+    data = await json(res);
+    const firstBet = data;
+    record('POST /api/v1/games/bets places a real bet', res.status === 201 && ['win', 'loss'].includes(data.outcome) && Number(data.balance) === 50000 - 1000 + Number(data.payout), JSON.stringify(data));
+
+    res = await fetch(`${BASE_URL}/api/v1/games/bets`, {
+      method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ gameId: 'wheel', stake: 1000, multiplier: 5, clientRequestId: betRequestId }),
+    });
+    data = await json(res);
+    record('resubmitting the same clientRequestId replays the same bet, not a second charge', res.status === 200 && data.betId === firstBet.betId && data.balance === firstBet.balance, JSON.stringify(data));
+
+    res = await fetch(`${BASE_URL}/api/v1/games/bets`, {
+      method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ gameId: 'wheel', stake: 999999, multiplier: 1.1, clientRequestId: crypto.randomUUID() }),
+    });
+    record('bet above stake ceiling rejected (400)', res.status === 400, JSON.stringify(await json(res)));
+
+    res = await fetch(`${BASE_URL}/api/v1/games/bets`, { headers: { Authorization: `Bearer ${token}` } });
+    record('bet endpoint requires POST (404 on GET)', res.status === 404);
+  }
+  res = await fetch(`${BASE_URL}/api/v1/games/bets`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ gameId: 'wheel', stake: 1000, multiplier: 5, clientRequestId: crypto.randomUUID() }),
+  });
+  record('bet without auth rejected (401)', res.status === 401, JSON.stringify(await json(res)));
+
   // 7b. Deposit-initiate: an unrecognized provider is always rejected (400)
   // regardless of mode/config, and a valid provider stays gated behind
   // WINZA_MODE=live + that provider's own credentials — on the typical
@@ -136,6 +196,20 @@ async function main() {
         res = await fetch(`${BASE_URL}/api/v1/account/limits/stake`, { method: 'PUT', headers: { 'content-type': 'application/json', Authorization: `Bearer ${rgToken}` }, body: JSON.stringify({ dailyStakeLimit: 5000 }) });
         data = await json(res);
         record('loosening a stake limit is scheduled, not immediate', res.ok && data.limits?.dailyStakeLimit === 1000 && data.limits?.pendingDailyStakeLimit === 5000, JSON.stringify(data));
+
+        // The daily stake limit (still 1000 — the loosening above hasn't
+        // taken effect yet) is enforced on /api/v1/games/bets itself, not
+        // just displayed — a bet within it succeeds, one that would push
+        // the trailing-24h total over it is blocked before any money moves.
+        res = await fetch(`${BASE_URL}/api/v1/wallet/sandbox-credit`, { method: 'POST', headers: { Authorization: `Bearer ${rgToken}` } });
+        if (res.status !== 403) {
+          res = await fetch(`${BASE_URL}/api/v1/games/bets`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${rgToken}` }, body: JSON.stringify({ gameId: 'wheel', stake: 900, multiplier: 2, clientRequestId: crypto.randomUUID() }) });
+          record('bet within the daily stake limit succeeds', res.status === 201, JSON.stringify(await json(res)));
+
+          res = await fetch(`${BASE_URL}/api/v1/games/bets`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${rgToken}` }, body: JSON.stringify({ gameId: 'wheel', stake: 900, multiplier: 2, clientRequestId: crypto.randomUUID() }) });
+          data = await json(res);
+          record('bet exceeding the daily stake limit is blocked (429)', res.status === 429 && /daily stake limit/i.test(data.error || ''), JSON.stringify(data));
+        }
 
         res = await fetch(`${BASE_URL}/api/v1/account/limits/self-exclude`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${rgToken}` }, body: '{}' });
         record('POST /api/v1/account/limits/self-exclude', res.ok);

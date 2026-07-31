@@ -22,6 +22,12 @@ const MODE = process.env.WINZA_MODE || 'sandbox';
 // code straight back out of the API response.
 const OTP_DEV_ECHO = process.env.OTP_DEV_ECHO === 'true';
 const JWT_SECRET = process.env.JWT_SECRET || '';
+// Keys the tamper-evident audit fingerprint stored on every bet (see
+// game-engine.js). Not an encryption key and never sent to the client, so
+// reusing JWT_SECRET as a fallback is safe (the HMAC label domain-separates
+// it from JWT signing) — set a dedicated GAME_AUDIT_SECRET if you'd rather
+// rotate the two independently.
+const GAME_AUDIT_SECRET = process.env.GAME_AUDIT_SECRET || JWT_SECRET;
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const root = __dirname;
 function sslConfig() {
@@ -142,6 +148,18 @@ async function getRecentWithdrawalActivity(walletId) {
     [walletId]
   );
   return { total: Number(rows[0].total), count: rows[0].count };
+}
+
+// Sums this user's bet stakes over the trailing 24 hours, for enforcing
+// player_limits.daily_stake_limit in /api/v1/games/bets — same trailing-24h
+// convention as getRecentWithdrawalActivity above, and same reasoning: a
+// player shouldn't be able to reset the window by any client-side action.
+async function getDailyStakeTotal(userId) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(stake),0)::numeric AS total FROM bets WHERE user_id=$1 AND created_at > now() - interval '24 hours'`,
+    [userId]
+  );
+  return Number(rows[0].total);
 }
 
 async function handleAuth(req,res,url,requestId,ip) {
@@ -293,6 +311,31 @@ async function handleAuth(req,res,url,requestId,ip) {
   if (req.method==='GET' && url.pathname==='/api/v1/auth/me') return send(res,200,{user:safeUser(user),requestId});
   if (req.method==='GET' && url.pathname==='/api/v1/wallet/me') { const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId); return send(res,200,{wallet:wallet.safeWallet(row),requestId}); }
 
+  // Sandbox-only faucet. WINZA_MODE stays 'sandbox' all the way through the
+  // public launch (see the WINZA_MODE comment near the top of this file), so
+  // real deposits never actually reach a wallet yet — this exists purely so
+  // the wheel/lotto game (a real, server-authoritative bet against this same
+  // cash_available balance — see /api/v1/games/bets) has something to play
+  // with pre-launch, the same role winza.html's old client-side "refill demo
+  // balance" reset used to serve. Hard-disabled the instant WINZA_MODE=live:
+  // nobody should ever be able to manufacture real cash this way.
+  if (req.method==='POST' && url.pathname==='/api/v1/wallet/sandbox-credit') {
+    if (MODE==='live') return fail(res,403,'Not available.',requestId);
+    const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId);
+    // Bounded regardless of what's requested — winza.html's "Refill demo
+    // balance" button omits this (defaults to a full refill) and the
+    // loyalty-points redemption UI passes a smaller amount, but neither the
+    // client nor this endpoint can ever manufacture more than the cap below,
+    // and it's completely inert the instant WINZA_MODE=live either way.
+    const requested=data.amount===undefined?50000:Number(data.amount);
+    if (!Number.isFinite(requested) || !Number.isInteger(requested) || requested<100 || requested>50000) {
+      return fail(res,400,'amount must be a whole number between ₦100 and ₦50,000.',requestId);
+    }
+    const result=await wallet.postTransaction(pool,{ walletId:row.id, type:'bonus', idempotencyKey:crypto.randomUUID(), referenceType:'sandbox_faucet', entries:[{balanceType:'cash_available',amount:requested}] });
+    audit(user.user_id,'wallet.sandbox_credit',ip,{amount:requested});
+    return send(res,200,{ wallet:wallet.safeWallet(result.wallet), requestId });
+  }
+
   // Deposits stay inert everywhere except a fully-configured live
   // deployment — /api/v1/public/config's realMoneyEnabled is hardcoded false
   // regardless of this. winza.html's deposit button does call this endpoint,
@@ -441,6 +484,93 @@ async function handleAuth(req,res,url,requestId,ip) {
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/enroll') { const secret=auth.randomBase32(); await pool.query('UPDATE users SET mfa_pending_secret_encrypted=$1 WHERE id=$2',[auth.encrypt(secret),user.user_id]);return send(res,200,{secret,otpauthUrl:`otpauth://totp/WINZA:${encodeURIComponent(user.email)}?secret=${secret}&issuer=WINZA&algorithm=SHA1&digits=6&period=30`,requestId}); }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/confirm') { const {rows}=await pool.query('SELECT mfa_pending_secret_encrypted FROM users WHERE id=$1',[user.user_id]);if(!rows[0]?.mfa_pending_secret_encrypted||!auth.validTotp(auth.decrypt(rows[0].mfa_pending_secret_encrypted),data.code))return fail(res,400,'Invalid authenticator code.',requestId);await pool.query('UPDATE users SET mfa_secret_encrypted=mfa_pending_secret_encrypted,mfa_pending_secret_encrypted=NULL,mfa_enabled_at=now() WHERE id=$1',[user.user_id]);audit(user.user_id,'auth.mfa_enabled',ip);return send(res,200,{message:'MFA enabled.',requestId}); }
   if (req.method==='POST' && url.pathname==='/api/v1/auth/mfa/disable') { if(!data.code)return fail(res,400,'Authenticator code is required.',requestId);const {rows}=await pool.query('SELECT mfa_secret_encrypted FROM users WHERE id=$1',[user.user_id]);if(!rows[0]?.mfa_secret_encrypted||!auth.validTotp(auth.decrypt(rows[0].mfa_secret_encrypted),data.code))return fail(res,400,'Invalid authenticator code.',requestId);await pool.query('UPDATE users SET mfa_secret_encrypted=NULL,mfa_enabled_at=NULL WHERE id=$1',[user.user_id]);audit(user.user_id,'auth.mfa_disabled',ip);return send(res,200,{message:'MFA disabled.',requestId}); }
+  return fail(res,404,'Not found',requestId);
+}
+
+// The only place a wheel/lotto bet is ever placed. The client sends the
+// stake, multiplier, and gameId it wants — nothing else it sends can affect
+// the outcome. Everything that decides win/loss and money movement (RNG,
+// RTP, the wallet debit/credit, the audit row) happens server-side inside
+// wallet.placeBet(); this handler is purely request validation plus turning
+// the result into the response the client is allowed to see.
+async function handleGames(req,res,url,requestId,ip) {
+  if (!ready(res,requestId)) return;
+  let user; try { user=await sessionFrom(req); } catch { return fail(res,401,'Authentication required.',requestId); }
+
+  if (req.method==='POST' && url.pathname==='/api/v1/games/bets') {
+    const data=await body(req);
+    const gameId=String(data.gameId||'');
+    if (!rtpConfig.isValidGameId(gameId)) return fail(res,400,`gameId must be one of: ${rtpConfig.GAME_IDS.join(', ')}.`,requestId);
+    const stake=Number(data.stake);
+    if (!rtpConfig.isValidStake(stake)) return fail(res,400,`Stake must be a whole number between ₦${rtpConfig.STAKE_MIN.toLocaleString()} and ₦${rtpConfig.STAKE_MAX.toLocaleString()}.`,requestId);
+    const multiplier=Number(data.multiplier);
+    if (!rtpConfig.isValidMultiplier(multiplier)) return fail(res,400,`Multiplier must be between ${rtpConfig.MULTIPLIER_MIN}x and ${rtpConfig.MULTIPLIER_MAX}x, in 0.1 steps.`,requestId);
+    // The client generates one clientRequestId per spin/draw and resends the
+    // exact same value if it retries (e.g. after a dropped connection) —
+    // this is what makes a duplicate submission a safe no-op instead of a
+    // second charge. See wallet.placeBet()'s idempotency handling.
+    const clientRequestId=String(data.clientRequestId||'').trim();
+    if (!clientRequestId || clientRequestId.length>128) return fail(res,400,'A valid clientRequestId is required.',requestId);
+
+    // Same protection as login/withdrawal: a session issued just before a
+    // self-exclusion or cool-off started is still valid for up to 8 hours
+    // (see issueSession), so betting needs its own check too.
+    const limits=await getEffectiveLimits(user.user_id);
+    const restriction=restrictionFromLimits(limits);
+    if (restriction) return fail(res,403,restrictionMessage(restriction),requestId);
+
+    if (limits && limits.daily_stake_limit!==null) {
+      const dailyLimit=Number(limits.daily_stake_limit);
+      const alreadyStaked=await getDailyStakeTotal(user.user_id);
+      if (alreadyStaked+stake>dailyLimit) {
+        return fail(res,429,`This bet would exceed your daily stake limit of ₦${dailyLimit.toLocaleString()}. You've staked ₦${alreadyStaked.toLocaleString()} in the last 24 hours.`,requestId);
+      }
+    }
+
+    const walletRow=await wallet.getWalletByUserId(pool,user.user_id);
+    if (!walletRow) return fail(res,404,'Wallet not found.',requestId);
+
+    const rtp=await getGameRtp();
+    let placed;
+    try {
+      placed=await wallet.placeBet(pool,{
+        userId:user.user_id, walletId:walletRow.id,
+        gameId, stake, multiplier, rtp,
+        clientRequestId, auditSecret:GAME_AUDIT_SECRET,
+        balanceType:'cash_available',
+        metadata:{ gameId },
+      });
+    } catch(e) {
+      // The pre-check inside placeBet already covers the common case; the
+      // wallets.cash_available >= 0 CHECK constraint (23514) is the
+      // database-level backstop if a race ever got past it.
+      if (e.code==='INSUFFICIENT_BALANCE' || e.code==='23514') return fail(res,400,'Insufficient balance for this stake.',requestId);
+      throw e;
+    }
+
+    const { bet, wallet:updatedWallet }=placed;
+    if (!placed.alreadyPlaced) {
+      audit(user.user_id, bet.result==='win'?'game.bet_won':'game.bet_lost', ip, {
+        betId:bet.id, gameId, stake:Number(bet.stake), multiplier:Number(bet.multiplier), payout:Number(bet.payout),
+      });
+    }
+    // Requirement: return only the final result — outcome, payout, updated
+    // balance, transaction id. Nothing here reveals the raw random draw, the
+    // chance used, or anything else that could help a client reverse-engineer
+    // or predict future outcomes; that detail lives only in the `bets` audit
+    // row for staff/regulatory review.
+    return send(res, placed.alreadyPlaced?200:201, {
+      outcome:bet.result,
+      stake:Number(bet.stake),
+      multiplier:Number(bet.multiplier),
+      payout:Number(bet.payout),
+      balance:Number(updatedWallet.cash_available),
+      betId:bet.id,
+      transactionId:bet.wallet_transaction_id,
+      requestId,
+    });
+  }
+
   return fail(res,404,'Not found',requestId);
 }
 
@@ -724,6 +854,7 @@ const server = http.createServer(async (req,res) => {
     }
 
     if(url.pathname.startsWith('/api/v1/admin/'))return await handleAdmin(req,res,url,requestId,ip);
+    if(url.pathname.startsWith('/api/v1/games/'))return await handleGames(req,res,url,requestId,ip);
     if(url.pathname.startsWith('/api/v1/auth/')||url.pathname.startsWith('/api/v1/wallet/')||url.pathname.startsWith('/api/v1/kyc/')||url.pathname.startsWith('/api/v1/account/'))return await handleAuth(req,res,url,requestId,ip);
     if(req.method==='GET'&&(url.pathname==='/'||url.pathname==='/winza.html'))return fs.readFile(path.join(root,'winza.html'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));
     if(req.method==='GET'&&(url.pathname==='/admin'||url.pathname==='/admin.html'))return fs.readFile(path.join(root,'admin.html'),'utf8',(e,file)=>e?fail(res,500,'Unable to load application',requestId):send(res,200,file,'text/html; charset=utf-8'));

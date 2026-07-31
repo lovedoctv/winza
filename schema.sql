@@ -63,7 +63,7 @@ CREATE TABLE wallets (
 CREATE TABLE wallet_transactions (
   id UUID PRIMARY KEY,
   wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE RESTRICT,
-  type TEXT NOT NULL CHECK (type IN ('deposit','withdrawal_request','withdrawal_reversal','stake','payout','bonus','adjustment')),
+  type TEXT NOT NULL CHECK (type IN ('deposit','withdrawal_request','withdrawal_reversal','stake','payout','bonus','adjustment','bet')),
   status TEXT NOT NULL DEFAULT 'posted' CHECK (status IN ('pending','posted','reversed','rejected')),
   idempotency_key TEXT NOT NULL,
   reference_type TEXT,
@@ -84,6 +84,44 @@ CREATE TABLE wallet_ledger_entries (
 );
 CREATE INDEX wallet_transactions_wallet_created_idx ON wallet_transactions(wallet_id, created_at DESC);
 CREATE INDEX wallet_ledger_entries_wallet_idx ON wallet_ledger_entries(wallet_id, created_at DESC);
+
+-- Every wheel/lotto wager, one row per bet. Written in the same database
+-- transaction as the wallet_transactions/wallet_ledger_entries rows that
+-- actually move the money (see wallet.js's placeBet()) — this table is the
+-- permanent audit record of *why* those ledger entries exist, not an
+-- independent source of truth about balances.
+--
+-- client_request_id is the idempotency key the client generates once per
+-- spin/draw and resends on retry; the UNIQUE constraint below is what makes
+-- a duplicate submission (double-tap, network retry) a no-op replay instead
+-- of a second charge — see /api/v1/games/bets in server.js.
+--
+-- random_value and audit_fingerprint exist so a disputed round can be
+-- verified after the fact: random_value is the raw [0,1) draw from the
+-- server's CSPRNG (see game-engine.js) that decided win/loss against
+-- `chance`, and audit_fingerprint is an HMAC over that draw keyed with a
+-- server-only secret, so staff can confirm a stored result wasn't altered
+-- without exposing anything that would help predict future draws.
+CREATE TABLE bets (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE RESTRICT,
+  wallet_transaction_id UUID NOT NULL REFERENCES wallet_transactions(id) ON DELETE RESTRICT,
+  game_id TEXT NOT NULL CHECK (game_id IN ('wheel','lotto')),
+  client_request_id TEXT NOT NULL,
+  stake NUMERIC(18,2) NOT NULL CHECK (stake > 0),
+  multiplier NUMERIC(6,2) NOT NULL CHECK (multiplier > 0),
+  rtp_used NUMERIC(5,4) NOT NULL,
+  chance NUMERIC(7,6) NOT NULL,
+  random_value DOUBLE PRECISION NOT NULL,
+  audit_fingerprint TEXT NOT NULL,
+  payout NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK (payout >= 0),
+  result TEXT NOT NULL CHECK (result IN ('win','loss')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (wallet_id, client_request_id)
+);
+CREATE INDEX bets_user_idx ON bets(user_id, created_at DESC);
+CREATE INDEX bets_wallet_idx ON bets(wallet_id, created_at DESC);
 
 -- Created the moment a player starts a deposit (before the provider has
 -- confirmed anything), so it doubles as a reconciliation trail for

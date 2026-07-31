@@ -1,9 +1,12 @@
 # WINZA production foundation
 
-This repository now has a safe deployment boundary and account-security API for the existing front-end.
-It starts in `sandbox` mode and intentionally rejects the idea that browser
-balances are real funds. KYC, withdrawal-request scaffolding, and deposits via
-Paystack/OPay exist, but there is still no wagering or actual payout system yet.
+This repository now has a safe deployment boundary, an account-security API,
+and a server-authoritative wheel/lotto betting engine for the existing
+front-end. It starts in `sandbox` mode and intentionally rejects the idea
+that browser balances are real funds — but every spin/draw is now a real,
+server-recorded bet against the account's real wallet balance (see "Wheel/lotto
+betting" below), not a client-side `Math.random()` simulation. KYC,
+withdrawal-request scaffolding, and deposits via Paystack/OPay exist too.
 Authentication requires PostgreSQL and environment secrets before it can run.
 
 ## Run locally
@@ -14,9 +17,9 @@ Authentication requires PostgreSQL and environment secrets before it can run.
    applied an earlier version of `schema.sql`, run `migration_002_phone_kyc.sql`,
    `migration_003_rtp_config.sql`, `migration_004_phone_recovery.sql`,
    `migration_005_player_limits.sql`, `migration_006_sanctions_screening.sql`,
-   `migration_007_withdrawal_limits.sql`, and `migration_008_deposit_intents.sql`
-   instead, in that order — each only adds columns/tables, safe to run against
-   an existing database.
+   `migration_007_withdrawal_limits.sql`, `migration_008_deposit_intents.sql`,
+   and `migration_009_bets.sql` instead, in that order — each only adds
+   columns/tables, safe to run against an existing database.
 4. Copy `.env.example` values into your deployment secret manager and generate distinct `JWT_SECRET` and `MFA_ENCRYPTION_KEY` values.
 5. Run `npm start`.
 6. Open `http://127.0.0.1:3000`.
@@ -69,6 +72,57 @@ A wallet row is still created automatically, in the same transaction as the user
 row, for every new account. There is still no route that lets anyone adjust a
 balance directly — money only moves through `wallet.postTransaction()`, following
 the same idempotency-key/row-locking/append-only-ledger guarantees as before.
+
+## Wheel/lotto betting (server-authoritative)
+
+The client never decides win/loss, never computes a payout, and never
+mutates the balance itself — it sends `{ gameId, stake, multiplier }` to the
+server and renders whatever comes back. Everything that determines the
+outcome and moves money lives server-side:
+
+- `POST /api/v1/games/bets` — `{ gameId: "wheel"|"lotto", stake, multiplier,
+  clientRequestId }`. Requires an authenticated session. Validates, in order:
+  stake is a whole number within `rtp-config.js`'s `STAKE_MIN`/`STAKE_MAX`
+  (₦100–₦50,000); multiplier is within `MULTIPLIER_MIN`/`MULTIPLIER_MAX`
+  (1.1×–10×) on the same 0.1 step the client's slider offers; the account
+  isn't in an active cool-off/self-exclusion (same check as login/withdrawal);
+  and the bet wouldn't push the account's trailing-24h stake total over its
+  `player_limits.daily_stake_limit`, if one is set. `clientRequestId` is a
+  client-generated idempotency key — resubmitting the same value (a retried
+  request after a dropped connection, a double-tap) replays the original
+  result instead of charging twice; see `wallet.placeBet()`.
+- The outcome itself is generated in `game-engine.js`: a cryptographically
+  secure random draw (`crypto.randomInt`, never `Math.random()`) compared
+  against a chance derived from the configured RTP and the chosen multiplier
+  (`chance = clamp(rtp / multiplier, MIN_CHANCE, MAX_CHANCE)` — the same
+  formula `rtp-config.js` exposes to the client for its pre-bet odds preview,
+  so the preview can never drift from what the server actually resolves).
+  Winning payout is `round(stake × multiplier / 100) × 100`.
+- `wallet.placeBet()` (in `wallet.js`) settles the whole thing in a single
+  database transaction: locks the wallet row (`SELECT ... FOR UPDATE`),
+  checks the balance, resolves the outcome, writes the stake-debit and (if a
+  win) payout-credit as `wallet_ledger_entries` under one new `bet`-typed
+  `wallet_transactions` row, updates the wallet balance, and inserts the
+  audit row into `bets` — all committed together or none of it is. Row
+  locking means a concurrent retry with the same `clientRequestId` blocks
+  until the first attempt finishes rather than racing it.
+- Every bet is recorded in `bets`: stake, multiplier, the RTP actually used,
+  the computed chance, the raw `[0,1)` random draw, an HMAC audit fingerprint
+  over that draw (keyed with `GAME_AUDIT_SECRET`, never sent to the client —
+  see `.env.example`), payout, result, and timestamps. This is the permanent
+  record for disputes, regulatory reporting, and RTP verification.
+- The response back to the client is deliberately minimal: `{ outcome,
+  stake, multiplier, payout, balance, betId, transactionId }`. Nothing about
+  the random draw, the chance used, or anything else that could help predict
+  future outcomes.
+- Bets stake and pay out against the same real wallet balance shown
+  everywhere else (`wallets.cash_available`) — there is no separate
+  play-money ledger. Since deposits stay gated behind `WINZA_MODE=live` (see
+  below), that balance is ₦0 for every account until then; `POST
+  /api/v1/wallet/sandbox-credit` (no body, or `{ amount }` bounded
+  ₦100–₦50,000) is a sandbox-only faucet that credits it for testing —
+  hard-disabled with 403 the instant `WINZA_MODE=live`, the same gating
+  pattern as `OTP_DEV_ECHO`.
 
 ### Deposits (Paystack / OPay) — built, but inert until deliberately switched on
 
@@ -197,12 +251,12 @@ longer undoes them.
 Starting a cool-off or self-exclusion immediately revokes every active
 session on the account. While either is in effect, `POST
 /api/v1/auth/otp/verify` refuses to issue a new session (with a message
-naming which restriction and until when), and `POST
-/api/v1/wallet/withdrawal-requests` checks it again as defense-in-depth for
-a session that was already issued in the hours just before a restriction
-started. There's currently no server-mediated wagering endpoint — gameplay
-itself is still a client-side simulation (see the top of this file) — so
-login and withdrawals are the two points that actually matter today.
+naming which restriction and until when), and both `POST
+/api/v1/wallet/withdrawal-requests` and `POST /api/v1/games/bets` check it
+again as defense-in-depth for a session that was already issued in the hours
+just before a restriction started. The daily stake limit is enforced the
+same way, directly on `POST /api/v1/games/bets` — see "Wheel/lotto betting"
+above — not just displayed in the UI.
 
 ## Admin panel
 
@@ -260,9 +314,14 @@ native Android/iOS shell — no separate frontend to maintain. See
   "KYC" above); document-photo verification does not yet — that needs object
   storage (an S3-compatible bucket or similar), which isn't part of this pass.
 - Withdrawal fraud/velocity limits now exist (see "Wallet" above).
-- Game/RNG certification, reporting, incident response, backups, observability
-  and penetration testing — none of this exists yet. These are largely external
-  audits and operational processes, not application code.
+- Server-authoritative, cryptographically-random, RTP-configured wheel/lotto
+  betting with a single-transaction ledger and a per-bet audit trail now
+  exists (see "Wheel/lotto betting" above). Independent third-party RNG/RTP
+  certification from the operating jurisdiction's approved testing lab does
+  not — that's an external audit, not something this codebase can self-certify.
+- Reporting, incident response, backups, observability, and penetration
+  testing — none of this exists yet. These are largely external audits and
+  operational processes, not application code.
 
 Do not change `realMoneyEnabled` to true until these systems have been implemented,
 reviewed by the client's compliance and security teams, and approved for the
