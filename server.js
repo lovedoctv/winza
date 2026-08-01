@@ -10,6 +10,7 @@ const rtpConfig = require('./rtp-config');
 const sanctions = require('./sanctions');
 const paystackLib = require('./paystack');
 const opayLib = require('./opay');
+const gameEngine = require('./game-engine');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -861,4 +862,12 @@ const server = http.createServer(async (req,res) => {
     return fail(res,404,'Not found',requestId);
   } catch(e) { console.error(`[${requestId}]`,e); return fail(res,500,'Unexpected server error.',requestId); }
 });
-server.listen(PORT,HOST,()=>console.log(`WINZA ${MODE} server listening at http://${HOST}:${PORT}`));
+server.listen(PORT,HOST,()=>{
+  console.log(`WINZA ${MODE} server listening at http://${HOST}:${PORT}`);
+  // TEST MODE ONLY - REMOVE BEFORE PRODUCTION
+  // Loud, impossible-to-miss startup warning so FORCE_WIN_TEST_MODE can never
+  // be silently active on a deployment. See game-engine.js.
+  if (gameEngine.FORCE_WIN_TEST_MODE) {
+    console.warn('!!! WINZA_FORCE_WIN_DEV IS ACTIVE — every bet resolves as a WIN. This must NEVER be set outside local development. !!!');
+  }
+});
