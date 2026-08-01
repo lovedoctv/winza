@@ -19,19 +19,6 @@ function secureRandomDraw() {
   return { randomInt, randomValue: randomInt / RANDOM_RESOLUTION };
 }
 
-// TEST MODE ONLY - REMOVE BEFORE PRODUCTION
-// Lets a developer deterministically force every bet to win, for local
-// end-to-end testing of balance updates, payout calculation, transaction
-// history, and UI — without touching the real RTP/RNG decision logic above.
-// Gated the same way OTP_DEV_ECHO is in server.js: requires BOTH an explicit
-// per-deployment opt-in (WINZA_FORCE_WIN_DEV) AND WINZA_MODE !== 'live', so a
-// stray env var left set on a real deployment still can't rig outcomes —
-// WINZA_MODE stays 'sandbox' through the Play Store launch, same caveat as
-// OTP_DEV_ECHO. Leave WINZA_FORCE_WIN_DEV unset everywhere except your own
-// local machine.
-const MODE = process.env.WINZA_MODE || 'sandbox';
-const FORCE_WIN_TEST_MODE = MODE !== 'live' && process.env.WINZA_FORCE_WIN_DEV === 'true';
-
 // A tamper-evident fingerprint over the exact draw that decided a bet,
 // keyed with the server's own secret (never sent to the client). Lets staff
 // verify after the fact that a stored random_value/result genuinely matches
@@ -51,10 +38,7 @@ function auditFingerprint(secret, betId, randomInt) {
 function resolveBet({ stake, multiplier, rtp, auditSecret, betId }) {
   const chance = computeChance(rtp, multiplier);
   const { randomInt, randomValue } = secureRandomDraw();
-  // TEST MODE ONLY - REMOVE BEFORE PRODUCTION
-  // Only the win/loss decision is bypassed here; computePayout() below runs
-  // exactly as it would for a real win, so payout math is still exercised.
-  const win = FORCE_WIN_TEST_MODE ? true : randomValue < chance;
+  const win = randomValue < chance;
   const payout = win ? computePayout(stake, multiplier) : 0;
   return {
     chance,
@@ -65,4 +49,4 @@ function resolveBet({ stake, multiplier, rtp, auditSecret, betId }) {
   };
 }
 
-module.exports = { resolveBet, secureRandomDraw, auditFingerprint, RANDOM_RESOLUTION, FORCE_WIN_TEST_MODE };
+module.exports = { resolveBet, secureRandomDraw, auditFingerprint, RANDOM_RESOLUTION };
