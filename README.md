@@ -18,8 +18,13 @@ Authentication requires PostgreSQL and environment secrets before it can run.
    `migration_003_rtp_config.sql`, `migration_004_phone_recovery.sql`,
    `migration_005_player_limits.sql`, `migration_006_sanctions_screening.sql`,
    `migration_007_withdrawal_limits.sql`, `migration_008_deposit_intents.sql`,
-   and `migration_009_bets.sql` instead, in that order — each only adds
-   columns/tables, safe to run against an existing database.
+   `migration_009_bets.sql`, and `migration_010_withdrawal_review.sql`
+   instead, in that order — each only adds columns/tables, safe to run
+   against an existing database. **These do not run automatically on
+   deploy** — a fresh deploy of the app code alone does not apply them;
+   run each migration file against your database yourself (e.g. `psql
+   "$DATABASE_URL" -f migration_010_withdrawal_review.sql`) whenever a new
+   one is added.
 4. Copy `.env.example` values into your deployment secret manager and generate distinct `JWT_SECRET` and `MFA_ENCRYPTION_KEY` values.
 5. Run `npm start`.
 6. Open `http://127.0.0.1:3000`.
