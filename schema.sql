@@ -69,6 +69,13 @@ CREATE TABLE wallet_transactions (
   reference_type TEXT,
   reference_id TEXT,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  -- Only ever populated for withdrawal_request rows — staff review state for
+  -- that specific request, same idea as kyc_submissions' matching columns.
+  -- Left NULL for every other transaction type (deposit, bet, etc.), which
+  -- never go through a review step.
+  reviewed_by UUID REFERENCES users(id),
+  reviewed_at TIMESTAMPTZ,
+  rejection_reason TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (wallet_id, idempotency_key)
 );
@@ -83,6 +90,7 @@ CREATE TABLE wallet_ledger_entries (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX wallet_transactions_wallet_created_idx ON wallet_transactions(wallet_id, created_at DESC);
+CREATE INDEX wallet_transactions_withdrawal_review_idx ON wallet_transactions(status, created_at) WHERE type = 'withdrawal_request';
 CREATE INDEX wallet_ledger_entries_wallet_idx ON wallet_ledger_entries(wallet_id, created_at DESC);
 
 -- Every wheel/lotto wager, one row per bet. Written in the same database

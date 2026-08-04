@@ -78,7 +78,7 @@
   th { color: var(--chalk-dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
   .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; }
   .badge-pending { background: rgba(245,166,35,0.18); color: var(--ijebu-gold); }
-  .badge-verified, .badge-approved { background: rgba(31,169,123,0.18); color: var(--palm-green); }
+  .badge-verified, .badge-approved, .badge-posted { background: rgba(31,169,123,0.18); color: var(--palm-green); }
   .badge-rejected { background: rgba(232,82,60,0.18); color: var(--market-coral); }
   .queue-tabs { display: flex; gap: 8px; margin-bottom: 12px; }
   .queue-tab {
@@ -131,6 +131,7 @@
     <div class="queue-tabs">
       <button class="queue-tab active" data-queue="kyc" onclick="switchQueue('kyc')">KYC submissions</button>
       <button class="queue-tab" data-queue="recovery" onclick="switchQueue('recovery')">Phone recovery requests</button>
+      <button class="queue-tab" data-queue="withdrawals" onclick="switchQueue('withdrawals')">Withdrawal requests</button>
     </div>
     <div class="tabs" id="statusTabs">
       <button class="tab active" data-status="pending" onclick="switchTab('pending')">Pending</button>
@@ -147,8 +148,11 @@
   let currentTab = 'pending';
   let currentQueue = 'kyc';
   // KYC's non-pending status is "verified"; phone recovery's is "approved" —
-  // same tab UI, different label per queue.
-  const STATUS_LABELS = { kyc: ['pending', 'verified', 'rejected'], recovery: ['pending', 'approved', 'rejected'] };
+  // same tab UI, different label per queue. Withdrawals reuse
+  // wallet_transactions.status ('posted' means approved/paid) but the tab
+  // should still read "Approved" — see STATUS_DISPLAY below.
+  const STATUS_LABELS = { kyc: ['pending', 'verified', 'rejected'], recovery: ['pending', 'approved', 'rejected'], withdrawals: ['pending', 'posted', 'rejected'] };
+  const STATUS_DISPLAY = { posted: 'Approved' };
 
   function getToken() { return sessionStorage.getItem(tokenKey); }
   function toast(message) {
@@ -215,7 +219,7 @@
     document.querySelectorAll('.queue-tab').forEach(t => t.classList.toggle('active', t.dataset.queue === queue));
     const labels = STATUS_LABELS[queue];
     document.getElementById('statusTabs').innerHTML = labels.map((status, i) =>
-      `<button class="tab${i === 0 ? ' active' : ''}" data-status="${status}" onclick="switchTab('${status}')">${status[0].toUpperCase() + status.slice(1)}</button>`
+      `<button class="tab${i === 0 ? ' active' : ''}" data-status="${status}" onclick="switchTab('${status}')">${STATUS_DISPLAY[status] || (status[0].toUpperCase() + status.slice(1))}</button>`
     ).join('');
     loadQueue();
   }
@@ -233,9 +237,12 @@
       if (currentQueue === 'kyc') {
         const data = await api('/api/v1/admin/kyc/submissions?status=' + currentTab);
         renderQueue(data.submissions);
-      } else {
+      } else if (currentQueue === 'recovery') {
         const data = await api('/api/v1/admin/phone-recovery-requests?status=' + currentTab);
         renderRecoveryQueue(data.requests);
+      } else {
+        const data = await api('/api/v1/admin/withdrawal-requests?status=' + currentTab);
+        renderWithdrawalQueue(data.requests);
       }
     } catch (e) {
       container.innerHTML = '<div class="queue-empty">' + esc(e.message) + '</div>';
@@ -348,6 +355,50 @@
       </table>`;
   }
 
+  function renderWithdrawalQueue(requests) {
+    const container = document.getElementById('queueContainer');
+    if (!requests.length) {
+      container.innerHTML = '<div class="queue-empty">No ' + (STATUS_DISPLAY[currentTab] || currentTab).toLowerCase() + ' withdrawal requests.</div>';
+      return;
+    }
+    const rows = requests.map(w => {
+      const requested = new Date(w.requestedAt).toLocaleString();
+      const badge = '<span class="badge badge-' + w.status + '">' + (STATUS_DISPLAY[w.status] || w.status) + '</span>';
+      const kycCell = w.kycStatus === 'verified' ? '<span class="kyc-match">Verified</span>' : `<span class="kyc-mismatch">${esc(w.kycStatus)}</span>`;
+      let actionsCell;
+      if (w.status === 'pending') {
+        actionsCell = `
+          <div class="row-actions">
+            <button class="btn btn-approve" onclick="approveWithdrawal('${w.id}')">Approve</button>
+            <button class="btn btn-reject" onclick="toggleReject('${w.id}')">Reject</button>
+          </div>
+          <div class="reject-panel" id="reject-${w.id}">
+            <input type="text" id="reason-${w.id}" placeholder="Reason (shown to reviewer log)" maxlength="300" />
+            <button class="btn btn-reject" onclick="rejectWithdrawal('${w.id}')">Confirm reject</button>
+          </div>`;
+      } else if (w.status === 'rejected') {
+        actionsCell = '<span class="muted">' + esc(w.rejectionReason || 'No reason given') + '</span>';
+      } else {
+        actionsCell = '<span class="muted">Reviewed ' + new Date(w.reviewedAt).toLocaleString() + '</span>';
+      }
+      return `
+        <tr>
+          <td>${esc(w.displayName)}</td>
+          <td>${esc(w.phoneNumber)}</td>
+          <td>${kycCell}</td>
+          <td>₦${Number(w.amount).toLocaleString()}</td>
+          <td>${esc(requested)}</td>
+          <td>${badge}</td>
+          <td>${actionsCell}</td>
+        </tr>`;
+    }).join('');
+    container.innerHTML = `
+      <table>
+        <thead><tr><th>Player</th><th>Phone</th><th>KYC</th><th>Amount</th><th>Requested</th><th>Status</th><th>Action</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
   function toggleReject(id) {
     document.getElementById('reject-' + id).classList.toggle('open');
   }
@@ -397,6 +448,29 @@
     try {
       await api(`/api/v1/admin/phone-recovery-requests/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) });
       toast('Rejected.');
+      loadQueue();
+    } catch (e) { toast(e.message); }
+  }
+
+  // Approving here never moves real money by itself — this app has no
+  // automated payout. It only records the decision and releases the held
+  // balance; the actual bank transfer/payment-provider payout happens
+  // separately, outside the app, and should be done (or already have been
+  // done) before clicking this.
+  async function approveWithdrawal(id) {
+    if (!confirm('Confirm you have already paid this player (or are about to) via bank transfer/payment provider OUTSIDE this app. Approving here does not send money — it only marks the request reviewed.')) return;
+    try {
+      await api(`/api/v1/admin/withdrawal-requests/${id}/approve`, { method: 'POST', body: '{}' });
+      toast('Approved.');
+      loadQueue();
+    } catch (e) { toast(e.message); }
+  }
+
+  async function rejectWithdrawal(id) {
+    const reason = document.getElementById('reason-' + id).value.trim();
+    try {
+      await api(`/api/v1/admin/withdrawal-requests/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) });
+      toast('Rejected — funds returned to the player\'s balance.');
       loadQueue();
     } catch (e) { toast(e.message); }
   }

@@ -374,10 +374,10 @@ async function handleAuth(req,res,url,requestId,ip) {
   }
 
   // Withdrawal requests never auto-pay out — they just move funds into
-  // pending_withdrawal for staff to review (that review UI is a later step).
-  // What matters right now: if KYC is required, an unverified user is
-  // blocked here before anything is locked, and the backend decides that —
-  // not the client.
+  // pending_withdrawal, status='pending', for staff to review and
+  // approve/reject via /api/v1/admin/withdrawal-requests below. What matters
+  // right now: if KYC is required, an unverified user is blocked here before
+  // anything is locked, and the backend decides that — not the client.
   if (req.method==='POST' && url.pathname==='/api/v1/wallet/withdrawal-requests') {
     const amount=Number(data.amount);
     if (!Number.isFinite(amount) || amount<=0) return fail(res,400,'Enter a valid withdrawal amount.',requestId);
@@ -399,7 +399,7 @@ async function handleAuth(req,res,url,requestId,ip) {
     if (recentActivity.count+1>withdrawalLimits.count) return fail(res,429,`Daily withdrawal request limit reached (${withdrawalLimits.count} per 24 hours). Try again later or contact support.`,requestId);
     if (recentActivity.total+amount>withdrawalLimits.amount) return fail(res,429,`Daily withdrawal amount limit reached (₦${withdrawalLimits.amount.toLocaleString()} per 24 hours). Try again later or contact support.`,requestId);
     try {
-      const result=await wallet.postTransaction(pool,{ walletId:row.id, type:'withdrawal_request', idempotencyKey:data.idempotencyKey||crypto.randomUUID(), referenceType:'withdrawal', entries:[{balanceType:'cash_available',amount:-amount},{balanceType:'pending_withdrawal',amount}] });
+      const result=await wallet.postTransaction(pool,{ walletId:row.id, type:'withdrawal_request', status:'pending', idempotencyKey:data.idempotencyKey||crypto.randomUUID(), referenceType:'withdrawal', entries:[{balanceType:'cash_available',amount:-amount},{balanceType:'pending_withdrawal',amount}] });
       audit(user.user_id,'wallet.withdrawal_requested',ip,{amount});
       return send(res,201,{ wallet:wallet.safeWallet(result.wallet), requestId });
     } catch(e) { return fail(res,400,'Unable to process withdrawal request (insufficient balance).',requestId); }
@@ -589,6 +589,8 @@ async function handleAdmin(req,res,url,requestId,ip) {
 
   const approveMatch = req.method==='POST' && url.pathname.match(/^\/api\/v1\/admin\/kyc\/submissions\/([0-9a-f-]{36})\/approve$/);
   const rejectMatch  = req.method==='POST' && url.pathname.match(/^\/api\/v1\/admin\/kyc\/submissions\/([0-9a-f-]{36})\/reject$/);
+  const approveWithdrawalMatch = req.method==='POST' && url.pathname.match(/^\/api\/v1\/admin\/withdrawal-requests\/([0-9a-f-]{36})\/approve$/);
+  const rejectWithdrawalMatch  = req.method==='POST' && url.pathname.match(/^\/api\/v1\/admin\/withdrawal-requests\/([0-9a-f-]{36})\/reject$/);
   // Read-only RTP lookup — any staff role (support/risk/admin/owner, gated
   // above) can see the current configured RTP and its bounds.
   if (req.method==='GET' && url.pathname==='/api/v1/admin/game-config') {
@@ -626,6 +628,69 @@ async function handleAdmin(req,res,url,requestId,ip) {
     const results = await reconciliation.reconcileStuckDeposits(pool, { audit });
     audit(user.user_id,'admin.deposit_reconciliation_run',ip,{ triggeredBy:'manual', count:results.length });
     return send(res,200,{ results, requestId });
+  }
+
+  // Read-only queue of withdrawal requests — any staff role gated above
+  // (risk/admin/owner) can see it, same as the KYC queue. `status` mirrors
+  // wallet_transactions.status for type='withdrawal_request': 'pending'
+  // (awaiting review), 'posted' (approved — staff have paid the player
+  // outside the app), or 'rejected' (funds returned to cash_available).
+  if (req.method==='GET' && url.pathname==='/api/v1/admin/withdrawal-requests') {
+    const status=url.searchParams.get('status')||'pending';
+    if (!['pending','posted','rejected'].includes(status)) return fail(res,400,'Invalid status filter.',requestId);
+    const { rows }=await pool.query(`
+      SELECT wt.id, wt.status, wt.created_at, wt.reviewed_at, wt.rejection_reason, le.amount,
+             u.id AS user_id, u.display_name, u.phone_number, u.kyc_status
+      FROM wallet_transactions wt
+      JOIN wallets w ON w.id=wt.wallet_id
+      JOIN users u ON u.id=w.user_id
+      JOIN wallet_ledger_entries le ON le.transaction_id=wt.id AND le.balance_type='pending_withdrawal'
+      WHERE wt.type='withdrawal_request' AND wt.status=$1
+      ORDER BY wt.created_at ASC`,[status]);
+    return send(res,200,{ requests: rows.map(r=>({ id:r.id, status:r.status, userId:r.user_id, displayName:r.display_name, phoneNumber:r.phone_number, kycStatus:r.kyc_status, amount:Number(r.amount), requestedAt:r.created_at, reviewedAt:r.reviewed_at, rejectionReason:r.rejection_reason })), requestId });
+  }
+
+  // Approving/rejecting a withdrawal moves real money — same risk tier as
+  // RTP/withdrawal-limit changes, restricted beyond the risk/admin/owner
+  // gate above to admin/owner only.
+  //
+  // This app never pays out automatically (see README): approving here only
+  // records that staff have decided to pay the player via bank transfer/
+  // payment provider *outside* this app, and releases the held
+  // pending_withdrawal amount. The money movement (wallet.postTransaction)
+  // happens before the status flip, same ordering the deposit webhooks use —
+  // so if the process dies between the two, the ledger is already correct
+  // and a retried approve call is a safe no-op (idempotencyKey keyed off
+  // this request's id).
+  if (approveWithdrawalMatch) {
+    if (!['admin','owner'].includes(user.role)) return fail(res,403,'Forbidden.',requestId);
+    const withdrawalId=approveWithdrawalMatch[1];
+    const { rows }=await pool.query(`
+      SELECT wt.id, wt.wallet_id, le.amount FROM wallet_transactions wt
+      JOIN wallet_ledger_entries le ON le.transaction_id=wt.id AND le.balance_type='pending_withdrawal'
+      WHERE wt.id=$1 AND wt.type='withdrawal_request' AND wt.status='pending'`,[withdrawalId]);
+    const reqRow=rows[0];
+    if (!reqRow) return fail(res,404,'No pending withdrawal request with that id.',requestId);
+    await wallet.postTransaction(pool,{ walletId:reqRow.wallet_id, type:'payout', idempotencyKey:`payout_of_${reqRow.id}`, referenceType:'withdrawal_request', referenceId:reqRow.id, entries:[{balanceType:'pending_withdrawal',amount:-Number(reqRow.amount)}] });
+    await pool.query(`UPDATE wallet_transactions SET status='posted', reviewed_by=$1, reviewed_at=now() WHERE id=$2 AND status='pending'`,[user.user_id,reqRow.id]);
+    audit(user.user_id,'admin.withdrawal_approved',ip,{withdrawalId:reqRow.id, amount:reqRow.amount});
+    return send(res,200,{ message:'Approved.', requestId });
+  }
+  if (rejectWithdrawalMatch) {
+    if (!['admin','owner'].includes(user.role)) return fail(res,403,'Forbidden.',requestId);
+    const withdrawalId=rejectWithdrawalMatch[1];
+    const data=await body(req);
+    const { rows }=await pool.query(`
+      SELECT wt.id, wt.wallet_id, le.amount FROM wallet_transactions wt
+      JOIN wallet_ledger_entries le ON le.transaction_id=wt.id AND le.balance_type='pending_withdrawal'
+      WHERE wt.id=$1 AND wt.type='withdrawal_request' AND wt.status='pending'`,[withdrawalId]);
+    const reqRow=rows[0];
+    if (!reqRow) return fail(res,404,'No pending withdrawal request with that id.',requestId);
+    const reason=String(data.reason||'').trim().slice(0,300)||'Not specified';
+    await wallet.postTransaction(pool,{ walletId:reqRow.wallet_id, type:'withdrawal_reversal', idempotencyKey:`reversal_of_${reqRow.id}`, referenceType:'withdrawal_request', referenceId:reqRow.id, entries:[{balanceType:'pending_withdrawal',amount:-Number(reqRow.amount)},{balanceType:'cash_available',amount:Number(reqRow.amount)}] });
+    await pool.query(`UPDATE wallet_transactions SET status='rejected', reviewed_by=$1, reviewed_at=now(), rejection_reason=$2 WHERE id=$3 AND status='pending'`,[user.user_id,reason,reqRow.id]);
+    audit(user.user_id,'admin.withdrawal_rejected',ip,{withdrawalId:reqRow.id, amount:reqRow.amount, reason});
+    return send(res,200,{ message:'Rejected — funds returned to the player.', requestId });
   }
 
   const WITHDRAWAL_LIMIT_BOUNDS = { minAmount:1000, maxAmount:50000000, minCount:1, maxCount:50 };

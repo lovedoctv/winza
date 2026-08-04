@@ -61,8 +61,9 @@ Shared:
 
 - `GET /api/v1/wallet/me` — authenticated, read-only balance summary.
 - `POST /api/v1/wallet/withdrawal-requests` — `{ amount }`. Moves funds from
-  `cash_available` into `pending_withdrawal` (never pays out automatically — staff
-  review is a later step). **Blocked with 403 if KYC is required and the caller
+  `cash_available` into `pending_withdrawal` and records the request as
+  `wallet_transactions.status='pending'` — this app never pays out
+  automatically. **Blocked with 403 if KYC is required and the caller
   isn't `verified`** — see `platform_settings.kyc_required_for_withdrawal`, a
   backend-controlled flag, not a client one. **Also blocked with 429 if it would
   exceed the account's rolling 24-hour withdrawal limit** — a fully KYC-verified
@@ -70,6 +71,16 @@ Shared:
   requests/day. Admin/owner-adjustable via `GET`/`PUT
   /api/v1/admin/withdrawal-limits`, bounded to ₦1,000–₦50,000,000 and 1–50
   requests — always some cap, never unlimited, same principle as the RTP floor.
+- **Staff review** — `GET /api/v1/admin/withdrawal-requests?status=pending|posted|rejected`
+  lists requests (any of risk/admin/owner can view, same gate as the KYC
+  queue); `POST .../:id/approve` and `POST .../:id/reject` (admin/owner only,
+  same risk tier as RTP changes) resolve one. Approving releases the held
+  `pending_withdrawal` amount via a `payout` transaction — it does **not**
+  send money anywhere; staff pay the player via bank transfer/payment
+  provider outside the app, then click approve to record that. Rejecting
+  reverses the hold via a `withdrawal_reversal` transaction, returning the
+  funds to `cash_available`. Both are exposed in `admin.html`'s "Withdrawal
+  requests" tab, mirroring the KYC review UI.
 
 A wallet row is still created automatically, in the same transaction as the user
 row, for every new account. There is still no route that lets anyone adjust a
