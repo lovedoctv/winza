@@ -45,6 +45,36 @@ async function initializeTransaction({ amountNaira, reference, returnUrl }) {
   return { authorizationUrl: data.data.cashierUrl, reference: data.data.reference || reference };
 }
 
+// Used by the deposit reconciliation job (reconciliation.js) to actively ask
+// OPay for a transaction's real status, for deposit_intents rows stuck in
+// `pending` because the webhook never arrived. Built against OPay's publicly
+// documented Cashier status-query shape (same unverified-against-the-real-
+// docs caveat as initializeTransaction above — confirm the endpoint path and
+// response fields against your merchant dashboard before relying on this).
+async function queryTransactionStatus(reference) {
+  const merchantId = process.env.OPAY_MERCHANT_ID;
+  const publicKey = process.env.OPAY_PUBLIC_KEY;
+  const secretKey = process.env.OPAY_SECRET_KEY;
+  if (!merchantId || !publicKey || !secretKey) throw new Error('OPay is not configured.');
+  const payload = { country: 'NG', reference };
+  const response = await fetch(`${BASE_URL}/api/v1/international/cashier/status`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${publicKey}`,
+      merchantid: merchantId,
+      'content-type': 'application/json',
+      signature: sign(payload),
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.code !== '00000') throw new Error(data.message || 'OPay status query failed.');
+  const tx = data.data || {};
+  // Normalized to upper-case so the caller can compare against 'SUCCESS' the
+  // same way the webhook handler in server.js already does.
+  return { status: String(tx.status || '').toUpperCase(), amountKobo: Number(tx.amount?.total ?? tx.amount), reference: tx.reference || reference };
+}
+
 // OPay signs webhook bodies with HMAC-SHA512 over the raw request body,
 // sent in a signature header. This must run against the exact raw bytes
 // received — parsing to JSON and re-stringifying can reorder keys or change
@@ -62,4 +92,4 @@ function verifySignature(rawBody, signatureHeader) {
   return crypto.timingSafeEqual(expectedBuf, givenBuf);
 }
 
-module.exports = { initializeTransaction, verifySignature };
+module.exports = { initializeTransaction, queryTransactionStatus, verifySignature };
