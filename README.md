@@ -164,6 +164,19 @@ launch" below for what still has to happen first.
   goes through — a retried webhook delivery is a no-op, not a double-credit.
   Any other event type, or a reference that's unknown or already completed,
   is acknowledged with 200 and otherwise ignored.
+- **Deposit reconciliation** (`reconciliation.js`) — for `deposit_intents` rows
+  that stay `pending` because a webhook was dropped or the payer abandoned
+  checkout. Polls the relevant provider directly (`paystack.verifyTransaction`
+  / `opay.queryTransactionStatus`) for any row still `pending` after
+  `DEPOSIT_RECONCILE_AFTER_MINUTES` (default 30). A confirmed success credits
+  the wallet through the same idempotent `wallet.postTransaction()` the
+  webhook uses (keyed by the deposit's `reference`), so a late webhook and
+  this job resolving the same deposit is a no-op, not a double-credit; a
+  confirmed failure, or a row still unresolved after
+  `DEPOSIT_ABANDON_AFTER_HOURS` (default 24), is marked `failed`. Runs
+  automatically every `DEPOSIT_RECONCILE_INTERVAL_MINUTES` (default 15) and
+  is also triggerable on demand via `POST /api/v1/admin/reconcile-deposits`
+  (admin/owner only).
 - `PAYSTACK_SECRET_KEY` doubles as the webhook-signing secret — Paystack
   doesn't issue a separate one. OPay issues `OPAY_MERCHANT_ID`,
   `OPAY_PUBLIC_KEY`, and `OPAY_SECRET_KEY` separately from its merchant
@@ -308,11 +321,14 @@ native Android/iOS shell — no separate frontend to maintain. See
   OPay)" above. Still needed before flipping it on: real Paystack credentials
   tested end-to-end (only verified against a local mock so far), OPay's
   integration confirmed field-by-field against real merchant-dashboard docs
-  (this pass couldn't reach OPay's docs site — see the caveat above), a
-  payout/transfer flow for withdrawals (currently staff-reviewed only, no
-  automated payout), and a reconciliation job for deposit_intents rows that go
-  stuck `pending` (abandoned
-  checkout, dropped webhook).
+  (this pass couldn't reach OPay's docs site — see the caveat above). Withdrawals
+  are staff-reviewed only by design (no automated payout) — see "Wallet" above.
+  A reconciliation job for deposit_intents rows stuck `pending` (abandoned
+  checkout, dropped webhook) now exists: it polls the provider directly for
+  any deposit still pending after `DEPOSIT_RECONCILE_AFTER_MINUTES` (default
+  30), runs automatically every `DEPOSIT_RECONCILE_INTERVAL_MINUTES` (default
+  15), and is also triggerable on demand via `POST
+  /api/v1/admin/reconcile-deposits` (admin/owner only). See `reconciliation.js`.
 - KYC identity capture, staff review, and sanctions/PEP screening now exist (see
   "KYC" above); document-photo verification does not yet — that needs object
   storage (an S3-compatible bucket or similar), which isn't part of this pass.

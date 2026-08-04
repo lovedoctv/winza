@@ -10,6 +10,7 @@ const rtpConfig = require('./rtp-config');
 const sanctions = require('./sanctions');
 const paystackLib = require('./paystack');
 const opayLib = require('./opay');
+const reconciliation = require('./reconciliation');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -614,6 +615,19 @@ async function handleAdmin(req,res,url,requestId,ip) {
     return send(res,200,{ rtp, requestId });
   }
 
+  // Manually resolves deposit_intents rows stuck in `pending` (abandoned
+  // checkout, dropped webhook) by polling the provider directly — the same
+  // job also runs automatically on a timer (see the setInterval near
+  // server.listen below); this lets staff trigger it on demand instead of
+  // waiting for the next scheduled run. Same risk tier as RTP/withdrawal
+  // limits: it can credit a wallet, so admin/owner only.
+  if (req.method==='POST' && url.pathname==='/api/v1/admin/reconcile-deposits') {
+    if (!['admin','owner'].includes(user.role)) return fail(res,403,'Forbidden.',requestId);
+    const results = await reconciliation.reconcileStuckDeposits(pool, { audit });
+    audit(user.user_id,'admin.deposit_reconciliation_run',ip,{ triggeredBy:'manual', count:results.length });
+    return send(res,200,{ results, requestId });
+  }
+
   const WITHDRAWAL_LIMIT_BOUNDS = { minAmount:1000, maxAmount:50000000, minCount:1, maxCount:50 };
   if (req.method==='GET' && url.pathname==='/api/v1/admin/withdrawal-limits') {
     return send(res,200,{ limits:await getWithdrawalLimits(), bounds:WITHDRAWAL_LIMIT_BOUNDS, requestId });
@@ -862,3 +876,26 @@ const server = http.createServer(async (req,res) => {
   } catch(e) { console.error(`[${requestId}]`,e); return fail(res,500,'Unexpected server error.',requestId); }
 });
 server.listen(PORT,HOST,()=>console.log(`WINZA ${MODE} server listening at http://${HOST}:${PORT}`));
+
+// Automatic deposit reconciliation: catches deposit_intents rows a webhook
+// never resolved (dropped delivery, abandoned checkout) without waiting for
+// staff to trigger POST /api/v1/admin/reconcile-deposits by hand. No-op
+// without a database. `running` prevents a slow provider response from
+// causing overlapping runs to stack up if one takes longer than the interval.
+if (pool) {
+  const intervalMs = Number(process.env.DEPOSIT_RECONCILE_INTERVAL_MINUTES || 15) * 60_000;
+  let running = false;
+  const timer = setInterval(async () => {
+    if (running) return;
+    running = true;
+    try {
+      const results = await reconciliation.reconcileStuckDeposits(pool, { audit });
+      if (results.length) audit(null,'admin.deposit_reconciliation_run',null,{ triggeredBy:'scheduled', count:results.length });
+    } catch (e) {
+      console.error('Deposit reconciliation run failed:', e);
+    } finally {
+      running = false;
+    }
+  }, intervalMs);
+  timer.unref();
+}

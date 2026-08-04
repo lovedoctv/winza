@@ -33,6 +33,25 @@ async function initializeTransaction({ amountNaira, phoneNumber, reference, call
   return { authorizationUrl: data.data.authorization_url, accessCode: data.data.access_code, reference: data.data.reference };
 }
 
+// Used by the deposit reconciliation job (reconciliation.js) to actively ask
+// Paystack for a transaction's real status, for deposit_intents rows stuck in
+// `pending` because the webhook never arrived (dropped delivery, abandoned
+// checkout) rather than trusting the webhook as the only path to resolution.
+async function verifyTransaction(reference) {
+  const secretKey = process.env.PAYSTACK_SECRET_KEY;
+  if (!secretKey) throw new Error('PAYSTACK_SECRET_KEY is not configured.');
+  const response = await fetch(`${BASE_URL}/transaction/verify/${encodeURIComponent(reference)}`, {
+    headers: { authorization: `Bearer ${secretKey}` },
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.status) throw new Error(data.message || 'Paystack verify request failed.');
+  const tx = data.data || {};
+  // tx.status is one of Paystack's own values: 'success', 'failed',
+  // 'abandoned', 'reversed', etc. — passed through as-is rather than
+  // normalized here, so the caller decides what each one means.
+  return { status: tx.status, amountKobo: Number(tx.amount), reference: tx.reference || reference };
+}
+
 // Paystack signs webhook bodies with HMAC-SHA512 over the raw request body,
 // sent in the x-paystack-signature header. This must run against the exact
 // raw bytes received — parsing to JSON and re-stringifying can reorder keys
@@ -48,4 +67,4 @@ function verifySignature(rawBody, signatureHeader) {
   return crypto.timingSafeEqual(expectedBuf, givenBuf);
 }
 
-module.exports = { placeholderEmail, initializeTransaction, verifySignature };
+module.exports = { placeholderEmail, initializeTransaction, verifyTransaction, verifySignature };
