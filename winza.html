@@ -782,6 +782,11 @@
   // it comes from a server response (bet result, faucet credit, deposit,
   // withdrawal), never from client-side arithmetic.
   let serverWallet = null;
+  // Real transaction history fetched from /api/v1/wallet/transactions —
+  // null until loaded (or signed out), distinct from state.transactions
+  // (the local sandbox-only log below) so renderWallet() knows which one
+  // to display; see refreshServerTransactions().
+  let serverTransactions = null;
   function walletBalance() { return Number(serverWallet && serverWallet.cashAvailable || 0); }
 
   const el = {
@@ -1244,17 +1249,25 @@
   }
 
   function renderWallet() {
-    if (state.transactions.length === 0) {
+    // Signed in: show the real server-recorded history (deposits,
+    // withdrawals, actual bets) instead of the local sandbox-only log —
+    // see refreshServerTransactions(). Signed out: nothing real to show
+    // (every wallet action requires auth), so fall back to the local log.
+    const signedIn = Boolean(sessionStorage.getItem('wz_access_token'));
+    const list = signedIn ? (serverTransactions || []) : state.transactions;
+    if (list.length === 0) {
       el.txList.innerHTML = '<div class="stub-empty" style="text-align:center;padding:10px 0;">No transactions yet.</div>';
       return;
     }
-    el.txList.innerHTML = state.transactions.slice(0, 30).map(tx => {
+    el.txList.innerHTML = list.slice(0, 30).map(tx => {
       let iconClass = tx.type;
       let amountClass = tx.amount >= 0 ? 'pos' : 'neg';
       let icon = '₦';
       if (tx.type === 'win') { iconClass = 'win'; amountClass = 'win'; icon = '★'; }
       if (tx.type === 'loss') { iconClass = 'loss'; icon = '✕'; }
-      if (tx.type === 'loyalty') { iconClass = 'loyalty'; amountClass = 'pos'; icon = '♦'; }
+      if (tx.type === 'loyalty' || tx.type === 'bonus') { iconClass = 'loyalty'; icon = '♦'; }
+      if (tx.type === 'withdrawal_request') { iconClass = 'withdraw'; }
+      if (tx.type === 'withdrawal_reversal') { iconClass = 'deposit'; }
       return `<div class="tx-row">
         <div class="tx-type"><div class="tx-icon ${iconClass}">${icon}</div><div><div style="font-weight:600;">${tx.note}</div><div class="tx-time">${timeAgo(tx.time)}</div></div></div>
         <div class="tx-amount ${amountClass}">${tx.amount >= 0 ? '+' : ''}${formatMoney(tx.amount)}</div>
@@ -1406,6 +1419,7 @@
     serverWallet = { ...(serverWallet || {}), cashAvailable: result.balance };
     renderAccountWallet();
     addTx('loss', -stake, `${state.mode === 'wheel' ? 'Wheel' : 'Lotto'} stake`);
+    refreshServerTransactions();
 
     const win = result.outcome === 'win';
     const payout = Number(result.payout || 0);
@@ -1466,7 +1480,7 @@
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
     document.getElementById('tab-' + tab).classList.add('active');
     document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-    if (tab === 'wallet') { renderWallet(); refreshServerWallet(); refreshKycStatus(); }
+    if (tab === 'wallet') { renderWallet(); refreshServerWallet(); refreshServerTransactions(); refreshKycStatus(); }
     if (tab === 'profile') renderProfile();
     if (tab === 'leaderboard') renderLeaderboard();
     if (tab === 'settings') renderSettingsToggles();
@@ -1557,6 +1571,7 @@
         if (!response.ok) throw new Error(data.error || 'Unable to submit withdrawal request.');
         serverWallet = data.wallet;
         renderAccountWallet();
+        refreshServerTransactions();
         showToast('Withdrawal request submitted for review.');
       } catch (error) {
         showToast(error.message);
@@ -2106,6 +2121,7 @@
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || 'Unable to credit balance.');
     serverWallet = data.wallet;
+    refreshServerTransactions();
   }
 
   window.spinLuckyWheel = async function() {
@@ -2228,6 +2244,20 @@
     renderAccountWallet();
   }
 
+  async function refreshServerTransactions() {
+    const token = sessionStorage.getItem('wz_access_token');
+    if (!token) { serverTransactions = null; renderWallet(); return; }
+    try {
+      const response = await fetch('/api/v1/wallet/transactions', { headers: { Authorization: 'Bearer ' + token } });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || 'Unable to load transactions');
+      serverTransactions = data.transactions;
+    } catch (error) {
+      serverTransactions = null;
+    }
+    renderWallet();
+  }
+
   // --- KYC status. "Not verified" is the default for every new account —
   // nothing is collected at registration. Whether verification is actually
   // required before a withdrawal is entirely the backend's call; this card
@@ -2287,6 +2317,7 @@
       currentAccountUser = data.user;
       renderAccountUI();
       await refreshServerWallet();
+      await refreshServerTransactions();
       await refreshKycStatus();
     } catch (error) {
       sessionStorage.removeItem('wz_access_token');
@@ -2298,7 +2329,7 @@
     }
   }
   document.getElementById('authPhoneForm').addEventListener('submit',async event=>{event.preventDefault();const phone=document.getElementById('authPhone').value.trim(),button=document.getElementById('authPhoneSubmit');button.disabled=true;try{const data=await authRequest('/api/v1/auth/otp/request',{phone});authPhone=phone;document.getElementById('authPhoneDisplay').textContent=phone;document.getElementById('authPhoneForm').hidden=true;document.getElementById('authOtpForm').hidden=false;document.getElementById('authTitle').textContent='Enter your code';document.getElementById('authOtpCode').value='';const note=document.getElementById('authDevCodeNote');if(data.devCode){note.hidden=false;note.textContent='Testing mode — no SMS provider configured yet. Code: '+data.devCode;}else{note.hidden=true;}showToast('Code sent.');}catch(error){showToast(error.message);}finally{button.disabled=false;}});
-  document.getElementById('authOtpForm').addEventListener('submit',async event=>{event.preventDefault();const code=document.getElementById('authOtpCode').value.trim(),button=document.getElementById('authOtpSubmit');button.disabled=true;try{const data=await authRequest('/api/v1/auth/otp/verify',{phone:authPhone,code});sessionStorage.setItem('wz_access_token',data.accessToken);document.getElementById('accountBtn').textContent=data.user.displayName;currentAccountUser=data.user;renderAccountUI();closeAuth();showToast(data.isNewAccount?'Account created — welcome!':'Signed in successfully.');await refreshServerWallet();await refreshKycStatus();}catch(error){showToast(error.message);}finally{button.disabled=false;}});
+  document.getElementById('authOtpForm').addEventListener('submit',async event=>{event.preventDefault();const code=document.getElementById('authOtpCode').value.trim(),button=document.getElementById('authOtpSubmit');button.disabled=true;try{const data=await authRequest('/api/v1/auth/otp/verify',{phone:authPhone,code});sessionStorage.setItem('wz_access_token',data.accessToken);document.getElementById('accountBtn').textContent=data.user.displayName;currentAccountUser=data.user;renderAccountUI();closeAuth();showToast(data.isNewAccount?'Account created — welcome!':'Signed in successfully.');await refreshServerWallet();await refreshServerTransactions();await refreshKycStatus();}catch(error){showToast(error.message);}finally{button.disabled=false;}});
   document.getElementById('kycForm').addEventListener('submit',async event=>{event.preventDefault();const button=document.getElementById('kycSubmit');button.disabled=true;try{const token=sessionStorage.getItem('wz_access_token');const response=await fetch('/api/v1/kyc/submit',{method:'POST',headers:{'content-type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({fullName:document.getElementById('kycFullName').value,dateOfBirth:document.getElementById('kycDob').value,idType:document.getElementById('kycIdType').value,idNumber:document.getElementById('kycIdNumber').value})});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Unable to submit.');showToast('Submitted for review.');closeKyc();await refreshKycStatus();}catch(error){showToast(error.message);}finally{button.disabled=false;}});
   setInterval(()=>{liveFeed.unshift({name:FEED_NAMES[Math.floor(Math.random()*FEED_NAMES.length)],text:['won ₦25,000','hit a jackpot','earned VIP Gold','opened a Lucky Box'][Math.floor(Math.random()*4)]});liveFeed=liveFeed.slice(0,8);renderEnhancements();},5500);
   function load() {
@@ -2375,6 +2406,7 @@
     showToast('Thanks — confirming your deposit. Check your wallet balance in a moment.');
     switchTab('wallet');
     await refreshServerWallet();
+    await refreshServerTransactions();
   }
 
   load();

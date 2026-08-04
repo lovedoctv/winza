@@ -65,6 +65,16 @@ Shared:
 ## Wallet
 
 - `GET /api/v1/wallet/me` — authenticated, read-only balance summary.
+- `GET /api/v1/wallet/transactions?limit=` (default 30, max 100) — the
+  player's own real transaction history: deposits, withdrawal
+  requests/rejections, and actual bets (with game/result/multiplier), read
+  from `wallet_transactions`/`bets`. Excludes `payout` rows (releasing a
+  held withdrawal once staff approve — see below — never touches
+  `cash_available`, so there's nothing new to show beyond the
+  `withdrawal_request` the player already saw). `winza.html`'s Transaction
+  History card used to be entirely local/client-side (sandbox game-play and
+  reward events only, never the real thing) — it now calls this endpoint
+  whenever signed in.
 - `POST /api/v1/wallet/withdrawal-requests` — `{ amount }`. Moves funds from
   `cash_available` into `pending_withdrawal` and records the request as
   `wallet_transactions.status='pending'` — this app never pays out

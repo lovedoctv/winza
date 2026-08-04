@@ -312,6 +312,42 @@ async function handleAuth(req,res,url,requestId,ip) {
   if (req.method==='GET' && url.pathname==='/api/v1/auth/me') return send(res,200,{user:safeUser(user),requestId});
   if (req.method==='GET' && url.pathname==='/api/v1/wallet/me') { const row=await wallet.getWalletByUserId(pool,user.user_id); if(!row)return fail(res,404,'Wallet not found.',requestId); return send(res,200,{wallet:wallet.safeWallet(row),requestId}); }
 
+  // Real transaction history — winza.html's Transaction History card used to
+  // be entirely client-side (a local addTx() log in browser storage, never
+  // fetched from the server), so a player's actual deposits/withdrawals/bets
+  // never appeared there. This reads the real wallet_transactions/bets rows
+  // instead. `payout` transactions (releasing a held pending_withdrawal
+  // amount once staff approve — see /api/v1/admin/withdrawal-requests) are
+  // excluded: they never touch cash_available, so there's nothing new to
+  // show the player beyond the withdrawal_request they already saw.
+  if (req.method==='GET' && url.pathname==='/api/v1/wallet/transactions') {
+    const walletRow=await wallet.getWalletByUserId(pool,user.user_id); if(!walletRow)return fail(res,404,'Wallet not found.',requestId);
+    const limit=Math.min(Number(url.searchParams.get('limit'))||30,100);
+    const { rows }=await pool.query(`
+      SELECT wt.id, wt.type, wt.created_at,
+             COALESCE(le.amount,0) AS cash_delta,
+             b.game_id, b.result AS bet_result, b.multiplier AS bet_multiplier
+      FROM wallet_transactions wt
+      LEFT JOIN LATERAL (
+        SELECT SUM(amount) AS amount FROM wallet_ledger_entries WHERE transaction_id=wt.id AND balance_type='cash_available'
+      ) le ON true
+      LEFT JOIN bets b ON b.wallet_transaction_id=wt.id
+      WHERE wt.wallet_id=$1 AND wt.type<>'payout'
+      ORDER BY wt.created_at DESC
+      LIMIT $2`,[walletRow.id, limit]);
+    const transactions = rows.map(r=>{
+      const amount=Number(r.cash_delta);
+      if (r.type==='bet') {
+        const win=r.bet_result==='win';
+        const game=r.game_id==='wheel'?'Wheel':'Lotto';
+        return { type: win?'win':'loss', amount, note: win?`${game} win ${Number(r.bet_multiplier).toFixed(1)}×`:`${game} stake`, time:r.created_at };
+      }
+      const notes={ deposit:'Deposit', withdrawal_request:'Withdrawal requested', withdrawal_reversal:'Withdrawal rejected — refunded', bonus:'Bonus credit' };
+      return { type:r.type, amount, note: notes[r.type]||'Balance adjustment', time:r.created_at };
+    });
+    return send(res,200,{ transactions, requestId });
+  }
+
   // Sandbox-only faucet. WINZA_MODE stays 'sandbox' all the way through the
   // public launch (see the WINZA_MODE comment near the top of this file), so
   // real deposits never actually reach a wallet yet — this exists purely so
