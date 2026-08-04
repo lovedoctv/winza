@@ -324,7 +324,7 @@ async function handleAuth(req,res,url,requestId,ip) {
     const walletRow=await wallet.getWalletByUserId(pool,user.user_id); if(!walletRow)return fail(res,404,'Wallet not found.',requestId);
     const limit=Math.min(Number(url.searchParams.get('limit'))||30,100);
     const { rows }=await pool.query(`
-      SELECT wt.id, wt.type, wt.created_at,
+      SELECT wt.id, wt.type, wt.status, wt.created_at,
              COALESCE(le.amount,0) AS cash_delta,
              b.game_id, b.result AS bet_result, b.multiplier AS bet_multiplier
       FROM wallet_transactions wt
@@ -342,7 +342,16 @@ async function handleAuth(req,res,url,requestId,ip) {
         const game=r.game_id==='wheel'?'Wheel':'Lotto';
         return { type: win?'win':'loss', amount, note: win?`${game} win ${Number(r.bet_multiplier).toFixed(1)}×`:`${game} stake`, time:r.created_at };
       }
-      const notes={ deposit:'Deposit', withdrawal_request:'Withdrawal requested', withdrawal_reversal:'Withdrawal rejected — refunded', bonus:'Bonus credit' };
+      // A withdrawal_request row's own status flips to 'posted' once staff
+      // approve it (the money movement itself happens in a separate,
+      // excluded `payout` transaction — see the comment above) — reflect
+      // that here so an approved withdrawal doesn't sit forever labeled
+      // "requested" with no visible outcome.
+      if (r.type==='withdrawal_request') {
+        const note = r.status==='posted' ? 'Withdrawal approved — paid out' : 'Withdrawal requested';
+        return { type:r.type, amount, note, time:r.created_at };
+      }
+      const notes={ deposit:'Deposit', withdrawal_reversal:'Withdrawal rejected — refunded', bonus:'Bonus credit' };
       return { type:r.type, amount, note: notes[r.type]||'Balance adjustment', time:r.created_at };
     });
     return send(res,200,{ transactions, requestId });
