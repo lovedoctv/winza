@@ -3,6 +3,7 @@ const gameEngine = require('./game-engine');
 
 const ALLOWED_TYPES = new Set(['deposit', 'withdrawal_request', 'withdrawal_reversal', 'stake', 'payout', 'bonus', 'adjustment', 'bet']);
 const BALANCE_TYPES = new Set(['cash_available', 'bonus_available', 'locked_balance', 'pending_withdrawal']);
+const TX_STATUSES = new Set(['pending', 'posted', 'reversed', 'rejected']);
 const GAME_IDS = new Set(['wheel', 'lotto']);
 
 // Called inside the same DB transaction as user registration so every
@@ -42,6 +43,13 @@ function safeWallet(row) {
 //
 // Guarantees:
 //   - `type` must be one of the enumerated wallet_transactions types.
+//   - `status` defaults to 'posted' (money moved, nothing further to decide).
+//     Callers that need a staff-review step in between (withdrawal requests)
+//     pass 'pending' instead — the money still moves immediately (funds sit
+//     in `pending_withdrawal` either way), `status` only tracks whether
+//     staff have reviewed *this specific request* yet, same as
+//     kyc_submissions.status. The caller updates it to 'posted'/'rejected'
+//     once reviewed (see /api/v1/admin/withdrawal-requests in server.js).
 //   - Every entry must reference a real balance column and a non-zero amount.
 //   - The wallet row is locked (SELECT ... FOR UPDATE) for the duration of
 //     the transaction, so concurrent postings serialize instead of racing.
@@ -51,10 +59,11 @@ function safeWallet(row) {
 //     DELETE on wallet_ledger_entries for the application role); the wallets
 //     table's own CHECK (... >= 0) constraints reject anything that would
 //     drive a balance negative, aborting the whole transaction.
-async function postTransaction(pool, { walletId, type, idempotencyKey, referenceType, referenceId, entries, metadata = {} }) {
+async function postTransaction(pool, { walletId, type, idempotencyKey, referenceType, referenceId, entries, metadata = {}, status = 'posted' }) {
   if (!ALLOWED_TYPES.has(type)) throw new Error(`Unknown transaction type: ${type}`);
   if (!idempotencyKey) throw new Error('idempotencyKey is required.');
   if (!Array.isArray(entries) || entries.length === 0) throw new Error('At least one ledger entry is required.');
+  if (!TX_STATUSES.has(status)) throw new Error(`Unknown transaction status: ${status}`);
   for (const entry of entries) {
     if (!BALANCE_TYPES.has(entry.balanceType)) throw new Error(`Unknown balance type: ${entry.balanceType}`);
     if (typeof entry.amount !== 'number' || !Number.isFinite(entry.amount) || entry.amount === 0) {
@@ -71,10 +80,10 @@ async function postTransaction(pool, { walletId, type, idempotencyKey, reference
 
     const { rows: txRows } = await client.query(
       `INSERT INTO wallet_transactions (id, wallet_id, type, status, idempotency_key, reference_type, reference_id, metadata)
-       VALUES ($1,$2,$3,'posted',$4,$5,$6,$7)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (wallet_id, idempotency_key) DO NOTHING
        RETURNING id`,
-      [crypto.randomUUID(), walletId, type, idempotencyKey, referenceType || null, referenceId || null, metadata]
+      [crypto.randomUUID(), walletId, type, status, idempotencyKey, referenceType || null, referenceId || null, metadata]
     );
 
     if (!txRows[0]) {
